@@ -48,9 +48,13 @@ class TokenScanner:
         mint = data.get("mint", "")
         if not mint or self._already_alerted(mint):
             return
+        # Stamp receipt time immediately — before any processing delay
+        data["_receipt_time"] = time.time()
+        mc_sol = float(data.get("marketCapSol", 0) or 0)
+        sol = float(data.get("solAmount", 0) or 0)
+        logger.info(f"📥 Token: {data.get('name','?')} ({mint[:8]}...) mc_sol={mc_sol:.1f} sol={sol:.3f}")
         try:
             self._queue.put_nowait(("new", data))
-            logger.debug(f"Queued new token: {data.get('name', '?')} ({mint[:8]}...)")
         except asyncio.QueueFull:
             logger.warning("Queue full, dropping token")
 
@@ -58,6 +62,8 @@ class TokenScanner:
         mint = data.get("mint", "")
         if not mint or self._already_alerted(mint):
             return
+        data["_receipt_time"] = time.time()
+        logger.info(f"🔀 Migration: {data.get('name','?')} ({mint[:8]}...)")
         try:
             self._queue.put_nowait(("migrate", data))
         except asyncio.QueueFull:
@@ -101,6 +107,17 @@ class TokenScanner:
             if not mint:
                 return
 
+            # Calculate age in MINUTES from when PumpPortal first fired the event
+            receipt_time = data.get("_receipt_time", time.time())
+            token["receipt_age_minutes"] = (time.time() - receipt_time) / 60
+
+            # Also compute USD market cap using live SOL price
+            from pumpfun.api import get_sol_price
+            sol_price = get_sol_price()
+            mc_sol = token.get("market_cap_sol", 0)
+            if mc_sol > 0:
+                token["market_cap_usd"] = mc_sol * sol_price
+
             # Subscribe to live trades so we collect buy/sell data
             await self.pump.subscribe_token_trades(mint)
 
@@ -109,6 +126,9 @@ class TokenScanner:
 
             # Enrich with live trade data
             token = self.pump.enrich_with_trades(token)
+
+            # Update age in minutes after trade window
+            token["receipt_age_minutes"] = (time.time() - receipt_time) / 60
             token["age_seconds"] = time.time() - token["created_at"]
 
             # Unsubscribe to save memory
