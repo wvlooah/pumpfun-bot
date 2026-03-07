@@ -366,13 +366,26 @@ class PumpPortalClient:
         sol_price = get_sol_price()
 
         if td["buys"] + td["sells"] > 0:
-            token["tx_buys_5m"] = td["buys"]
+            token["tx_buys_5m"]  = td["buys"]
             token["tx_sells_5m"] = td["sells"]
+
         if td["volume_sol"] > 0:
             token["volume_5m_usd"] = td["volume_sol"] * sol_price
+            token["total_sol_fees"] = max(
+                token.get("total_sol_fees", 0),
+                td["volume_sol"]
+            )
+
         if td["market_cap_sol"] > 0:
-            token["market_cap_usd"] = td["market_cap_sol"] * sol_price
+            new_mc = td["market_cap_sol"] * sol_price
+            old_mc = token.get("market_cap_usd", 0) or 0
+            token["market_cap_usd"] = new_mc
             token["market_cap_sol"] = td["market_cap_sol"]
+            # Compute 5m price change from initial → current mc
+            if old_mc > 0 and new_mc > 0:
+                token["price_change_5m"] = ((new_mc - old_mc) / old_mc) * 100
+
         if td["last_price_sol"] > 0:
             token["price_usd"] = td["last_price_sol"] * sol_price
+
         return token

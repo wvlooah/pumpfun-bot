@@ -148,12 +148,22 @@ class TokenScanner:
         token["rug_freezable"]     = rug_report.get("freezable", False)
         token["rug_risks"]         = rug_report.get("risks", [])
         token["top10_holders_pct"] = rug_report.get("top_holder_pct", 0.0)
+        token["insider_pct"]       = rug_report.get("insider_pct", 0.0)
+        token["snipers_pct"]       = rug_report.get("snipers_pct", 0.0)
+        token["bundles_pct"]       = rug_report.get("bundles_pct", 0.0)
+        token["dev_holding_pct"]   = rug_report.get("dev_holding_pct", 0.0)
 
         token["dev_deploy_count"]    = dev_stats.get("deploy_count", 0)
         token["dev_migration_count"] = dev_stats.get("migration_count", 0)
         token["dev_success_ratio"]   = dev_stats.get("success_ratio", 0.0)
 
         if token["rug_status"] == "Danger":
+            return
+
+        # ── Post-rugcheck holder limits ───────────────────────────────────────
+        ok, reason = self.filters.passes_holder_limits(token, category)
+        if not ok:
+            logger.debug(f"🚫 Holder limit: {token['name']} — {reason}")
             return
 
         # ── Score + tier ──────────────────────────────────────────────────────
