@@ -1,11 +1,11 @@
 import logging
-from typing import Any
 
 import aiohttp
 
 logger = logging.getLogger("devstats")
 
-PUMPFUN_BASE = "https://client-api-2-74b1891ee9f9.herokuapp.com"
+# PumpPortal has a REST endpoint for dev wallet history
+PUMPPORTAL_API = "https://pumpportal.fun/api"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -28,58 +28,57 @@ class DevStatsModule:
 
     async def get_dev_stats(self, dev_wallet: str) -> dict:
         """
-        Fetch all tokens deployed by this developer wallet.
-        Returns:
-        {
-            wallet: str,
-            deploy_count: int,
-            migration_count: int,
-            success_ratio: float,
-            fees_paid_usd: float,
-            tokens: list[dict],
-        }
+        Fetch token launch history for a dev wallet.
+        Falls back gracefully if the endpoint isn't available.
         """
+        if not dev_wallet:
+            return self._default(dev_wallet)
+
         if dev_wallet in self._cache:
             return self._cache[dev_wallet]
 
-        default = {
+        # Try PumpPortal account data endpoint
+        result = await self._try_pumpportal(dev_wallet)
+        self._cache[dev_wallet] = result
+        return result
+
+    async def _try_pumpportal(self, dev_wallet: str) -> dict:
+        try:
+            session = await self._get_session()
+            # PumpPortal account trades endpoint
+            url = f"{PUMPPORTAL_API}/account-trades?publicKey={dev_wallet}&limit=50"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        return self._parse_trades(dev_wallet, data)
+        except Exception as e:
+            logger.debug(f"DevStats pumpportal {dev_wallet[:8]}...: {e}")
+
+        # Fallback: return minimal stats
+        return self._default(dev_wallet)
+
+    def _parse_trades(self, dev_wallet: str, trades: list) -> dict:
+        """Parse trade history to estimate deploy/migration count."""
+        # Count unique mints where dev was creator (txType=create)
+        creates = [t for t in trades if t.get("txType") == "create"]
+        migrations = [t for t in trades if t.get("txType") == "migrate"]
+
+        deploy_count = len(creates)
+        migration_count = len(migrations)
+        success_ratio = (migration_count / deploy_count * 100) if deploy_count > 0 else 0.0
+
+        return {
+            "wallet": dev_wallet,
+            "deploy_count": deploy_count,
+            "migration_count": migration_count,
+            "success_ratio": round(success_ratio, 1),
+        }
+
+    def _default(self, dev_wallet: str) -> dict:
+        return {
             "wallet": dev_wallet,
             "deploy_count": 0,
             "migration_count": 0,
             "success_ratio": 0.0,
-            "fees_paid_usd": 0.0,
-            "tokens": [],
         }
-
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/coins/user-created-coins/{dev_wallet}?offset=0&limit=50"
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"DevStats {dev_wallet}: HTTP {resp.status}")
-                    return default
-                tokens = await resp.json()
-
-            if not isinstance(tokens, list):
-                return default
-
-            deploy_count = len(tokens)
-            migration_count = sum(1 for t in tokens if t.get("raydium_pool") is not None)
-            fees_paid = sum(float(t.get("total_supply", 0)) * 0 for t in tokens)  # placeholder
-            success_ratio = (migration_count / deploy_count * 100) if deploy_count > 0 else 0.0
-
-            result = {
-                "wallet": dev_wallet,
-                "deploy_count": deploy_count,
-                "migration_count": migration_count,
-                "success_ratio": round(success_ratio, 1),
-                "fees_paid_usd": fees_paid,
-                "tokens": tokens[:10],  # Keep top 10 for memory
-            }
-
-            self._cache[dev_wallet] = result
-            return result
-
-        except Exception as e:
-            logger.error(f"DevStats error {dev_wallet}: {e}")
-            return default
