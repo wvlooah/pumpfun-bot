@@ -112,15 +112,19 @@ class PumpPortalClient:
             session = await self._get_session()
             url = f"{DEXSCREENER_API}/tokens/{mint}"
             async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pairs = data.get("pairs", [])
-                    for dex_id in ("pumpfun", "raydium"):
-                        for p in pairs:
-                            if p.get("dexId") == dex_id and p.get("chainId") == "solana":
-                                return p
-                    return pairs[0] if pairs else None
-                return None
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not isinstance(data, dict):
+                    return None
+                pairs = data.get("pairs") or []
+                if not isinstance(pairs, list):
+                    return None
+                for dex_id in ("pumpfun", "raydium"):
+                    for p in pairs:
+                        if isinstance(p, dict) and p.get("dexId") == dex_id and p.get("chainId") == "solana":
+                            return p
+                return pairs[0] if pairs else None
         except Exception as e:
             logger.error(f"Dexscreener {mint}: {e}")
             return None
@@ -194,26 +198,26 @@ class PumpPortalClient:
         token["is_dex_listed"] = True
         return token
 
-    def enrich_with_dexscreener(self, token: dict, dex: dict) -> dict:
+    def enrich_with_dexscreener(self, token: dict, dex: dict | None) -> dict:
         """Merge live Dexscreener price/volume data into token dict."""
-        if not dex:
+        if not dex or not isinstance(dex, dict):
             return token
-        pc = dex.get("priceChange", {})
-        vol = dex.get("volume", {})
-        txns = dex.get("txns", {}).get("m5", {})
+        pc = dex.get("priceChange") or {}
+        vol = dex.get("volume") or {}
+        txns = (dex.get("txns") or {}).get("m5") or {}
 
-        token["price_usd"] = float(dex.get("priceUsd", 0) or 0)
-        token["price_change_5m"] = float(pc.get("m5", 0) or 0)
-        token["price_change_1h"] = float(pc.get("h1", 0) or 0)
-        token["price_change_24h"] = float(pc.get("h24", 0) or 0)
-        token["volume_5m_usd"] = float(vol.get("m5", 0) or 0)
-        token["volume_1h_usd"] = float(vol.get("h1", 0) or 0)
-        token["volume_24h_usd"] = float(vol.get("h24", 0) or 0)
-        token["tx_buys_5m"] = int(txns.get("buys", 0) or 0)
-        token["tx_sells_5m"] = int(txns.get("sells", 0) or 0)
+        token["price_usd"] = float(dex.get("priceUsd") or 0)
+        token["price_change_5m"] = float(pc.get("m5") or 0)
+        token["price_change_1h"] = float(pc.get("h1") or 0)
+        token["price_change_24h"] = float(pc.get("h24") or 0)
+        token["volume_5m_usd"] = float(vol.get("m5") or 0)
+        token["volume_1h_usd"] = float(vol.get("h1") or 0)
+        token["volume_24h_usd"] = float(vol.get("h24") or 0)
+        token["tx_buys_5m"] = int(txns.get("buys") or 0)
+        token["tx_sells_5m"] = int(txns.get("sells") or 0)
         token["is_dex_listed"] = True
 
-        mc = float(dex.get("marketCap", 0) or 0)
+        mc = float(dex.get("marketCap") or 0)
         if mc > 0:
             token["market_cap_usd"] = mc
 

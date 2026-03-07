@@ -2,13 +2,10 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
 
 import discord
-from discord.ext import tasks
 from dotenv import load_dotenv
 
-from scanner.scanner import TokenScanner
 from discord_bot.client import BotClient
 
 load_dotenv()
