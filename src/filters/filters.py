@@ -1,22 +1,19 @@
+"""
+Filter classification.
+Priority order: soon_migrate → migrated → new_pair
+
+Pre-rugcheck: uses only data available from Mobula stream
+  (market_cap, age, sol_fees, socials, is_migrated)
+
+Post-rugcheck: holder health limits applied in scanner.py
+"""
+
 import logging
 from typing import Literal
 
 logger = logging.getLogger("filters")
 
 # ── Filter Definitions ────────────────────────────────────────────────────────
-# Ages in MINUTES. Market cap in USD. % values are percentages (0-100).
-#
-# NOTE: insider/sniper/bundle % come from rugcheck.xyz API after deep check.
-# The filter classify() runs BEFORE rugcheck, so we only use data available
-# from PumpPortal (mc, age, sol_fees, is_migrated, socials).
-# Holder health filters (top10, insider, sniper, bundle) are applied POST-rugcheck
-# inside the scanner as a hard-block, not here.
-
-FILTER_NEW_PAIRS = {
-    "MARKET_CAP_USD":    {"from": 3_000,  "to": None},
-    "TOKEN_AGE_MINUTES": {"from": None,   "to": 6},
-    "TOTAL_SOL_FEES":    {"from": 0.1,    "to": None},
-}
 
 FILTER_SOON_MIGRATE = {
     "MARKET_CAP_USD":    {"from": 8_000,  "to": None},
@@ -31,19 +28,25 @@ FILTER_MIGRATED = {
     "TOTAL_SOL_FEES":    {"from": 3.5,    "to": None},
 }
 
-# Post-rugcheck hard limits — if rugcheck returns data, these block the alert
+FILTER_NEW_PAIRS = {
+    "MARKET_CAP_USD":    {"from": 3_000,  "to": None},
+    "TOKEN_AGE_MINUTES": {"from": None,   "to": 6},
+    "TOTAL_SOL_FEES":    {"from": 0.1,    "to": None},
+}
+
+# Post-rugcheck holder limits — only applied if rugcheck returned data (non-zero)
 HOLDER_LIMITS = {
     "soon_migrate": {"top10": 40, "insider": 40, "sniper": 40, "bundle": 50, "dev": 40},
     "migrated":     {"top10": 40, "insider": 40, "sniper": 40, "bundle": 40, "dev": 40},
-    "new_pair":     {"top10": 80, "insider": 80, "sniper": 80, "bundle": 80, "dev": 80},  # loose for new
+    "new_pair":     {"top10": 80, "insider": 80, "sniper": 80, "bundle": 80, "dev": 80},
 }
 
 
-def _in_range(value, range_def: dict) -> bool:
+def _in_range(value, rng: dict) -> bool:
     if value is None:
         return False
-    lo = range_def.get("from")
-    hi = range_def.get("to")
+    lo = rng.get("from")
+    hi = rng.get("to")
     if lo is not None and value < lo:
         return False
     if hi is not None and value > hi:
@@ -54,69 +57,67 @@ def _in_range(value, range_def: dict) -> bool:
 class TokenFilters:
 
     @staticmethod
-    def classify(token: dict) -> Literal["new_pair", "soon_migrate", "migrated"] | None:
-        """
-        Classify token into a filter category based on available pre-rugcheck data.
-        Priority: soon_migrate → migrated → new_pair
-        """
-        receipt_age_min = token.get("receipt_age_minutes", token.get("age_seconds", 99999) / 60)
-        market_cap_usd  = token.get("market_cap_usd", 0) or 0
-        sol_fees        = token.get("total_sol_fees", 0) or 0
-        has_socials     = bool(token.get("twitter") or token.get("website"))
-        is_migrated     = token.get("is_migrated", False)
-        launchpad       = token.get("launchpad", "pumpfun").lower()
+    def classify(token: dict) -> Literal["soon_migrate", "migrated", "new_pair"] | None:
+        age_min    = token.get("receipt_age_minutes") or (token.get("age_seconds", 0) / 60)
+        mc_usd     = token.get("market_cap_usd", 0) or 0
+        sol_fees   = token.get("total_sol_fees", 0) or 0
+        has_socials = bool(token.get("twitter") or token.get("website"))
+        is_migrated = token.get("is_migrated", False)
+        launchpad   = (token.get("launchpad") or "pumpfun").lower()
 
-        if launchpad not in ["pumpfun", "bags", "bonk"]:
+        if launchpad not in ("pumpfun", "bags", "bonk"):
             return None
 
         # ── 1. Soon to Migrate ────────────────────────────────────────────────
         f = FILTER_SOON_MIGRATE
         if (
-            _in_range(market_cap_usd, f["MARKET_CAP_USD"])
-            and _in_range(receipt_age_min, f["TOKEN_AGE_MINUTES"])
+            _in_range(mc_usd, f["MARKET_CAP_USD"])
+            and _in_range(age_min, f["TOKEN_AGE_MINUTES"])
             and _in_range(sol_fees, f["TOTAL_SOL_FEES"])
             and has_socials
         ):
-            logger.info(f"✅ SOON_MIGRATE: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m sol={sol_fees:.2f}")
+            logger.info(
+                f"✅ SOON_MIGRATE: {token.get('name')} "
+                f"mc=${mc_usd:,.0f} age={age_min:.1f}m sol={sol_fees:.2f}"
+            )
             return "soon_migrate"
 
         # ── 2. Migrated ───────────────────────────────────────────────────────
         f = FILTER_MIGRATED
         if (
             is_migrated
-            and _in_range(market_cap_usd, f["MARKET_CAP_USD"])
-            and _in_range(receipt_age_min, f["TOKEN_AGE_MINUTES"])
+            and _in_range(mc_usd, f["MARKET_CAP_USD"])
+            and _in_range(age_min, f["TOKEN_AGE_MINUTES"])
             and _in_range(sol_fees, f["TOTAL_SOL_FEES"])
         ):
-            logger.info(f"✅ MIGRATED: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m sol={sol_fees:.2f}")
+            logger.info(
+                f"✅ MIGRATED: {token.get('name')} "
+                f"mc=${mc_usd:,.0f} age={age_min:.1f}m sol={sol_fees:.2f}"
+            )
             return "migrated"
 
         # ── 3. New Pair ───────────────────────────────────────────────────────
         f = FILTER_NEW_PAIRS
         if (
-            _in_range(market_cap_usd, f["MARKET_CAP_USD"])
-            and _in_range(receipt_age_min, f["TOKEN_AGE_MINUTES"])
+            _in_range(mc_usd, f["MARKET_CAP_USD"])
+            and _in_range(age_min, f["TOKEN_AGE_MINUTES"])
             and _in_range(sol_fees, f["TOTAL_SOL_FEES"])
         ):
-            logger.info(f"✅ NEW_PAIR: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m sol={sol_fees:.3f}")
+            logger.info(
+                f"✅ NEW_PAIR: {token.get('name')} "
+                f"mc=${mc_usd:,.0f} age={age_min:.1f}m sol={sol_fees:.3f}"
+            )
             return "new_pair"
 
         logger.debug(
             f"❌ No match: {token.get('name','?')} "
-            f"mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m "
-            f"sol={sol_fees:.3f} migrated={is_migrated}"
+            f"mc=${mc_usd:,.0f} age={age_min:.1f}m sol={sol_fees:.3f} migrated={is_migrated}"
         )
         return None
 
     @staticmethod
     def passes_holder_limits(token: dict, category: str) -> tuple[bool, str]:
-        """
-        Post-rugcheck holder health check.
-        Returns (passes, reason_if_failed).
-        Only blocks if rugcheck actually returned data (non-zero values).
-        """
         limits = HOLDER_LIMITS.get(category, HOLDER_LIMITS["new_pair"])
-
         top10   = token.get("top10_holders_pct", 0) or 0
         insider = token.get("insider_pct", 0) or 0
         sniper  = token.get("snipers_pct", 0) or 0
@@ -128,5 +129,4 @@ class TokenFilters:
         if sniper  > 0 and sniper  > limits["sniper"]:  return False, f"Snipers {sniper:.0f}% > {limits['sniper']}%"
         if bundle  > 0 and bundle  > limits["bundle"]:  return False, f"Bundles {bundle:.0f}% > {limits['bundle']}%"
         if dev     > 0 and dev     > limits["dev"]:     return False, f"Dev {dev:.0f}% > {limits['dev']}%"
-
         return True, "ok"
