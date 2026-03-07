@@ -1,97 +1,113 @@
 import asyncio
+import json
 import logging
-import os
-from typing import Any
+import time
+from typing import Callable
 
 import aiohttp
+import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 logger = logging.getLogger("pumpfun")
 
-PUMPFUN_BASE = "https://client-api-2-74b1891ee9f9.herokuapp.com"
-PUMPFUN_API = "https://pump.fun/api"
+PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
-
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
-class PumpFunAPI:
+class PumpPortalClient:
+    """
+    Websocket client for PumpPortal.
+    Streams new token creations and migration events in real time.
+    No API key required for bonding curve data.
+    """
+
     def __init__(self):
         self.session: aiohttp.ClientSession | None = None
+        self._ws = None
+        self._running = False
+        self._reconnect_delay = 5
+        self.on_new_token: Callable | None = None
+        self.on_migration: Callable | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; PumpBot/1.0)",
-                "Accept": "application/json",
-            }
             self.session = aiohttp.ClientSession(
-                headers=headers, timeout=REQUEST_TIMEOUT
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
             )
         return self.session
 
     async def close(self):
+        self._running = False
+        if self._ws:
+            await self._ws.close()
         if self.session and not self.session.closed:
             await self.session.close()
 
-    async def get_new_tokens(self, limit: int = 50) -> list[dict]:
-        """Fetch recently created Pump.fun tokens."""
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/coins?offset=0&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data if isinstance(data, list) else []
-                logger.warning(f"get_new_tokens HTTP {resp.status}")
-                return []
-        except Exception as e:
-            logger.error(f"get_new_tokens error: {e}")
-            return []
+    # ── Websocket stream ──────────────────────────────────────────────────────
 
-    async def get_trending_tokens(self, limit: int = 50) -> list[dict]:
-        """Fetch trending / high-volume Pump.fun tokens."""
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/coins?offset=0&limit={limit}&sort=last_trade_timestamp&order=DESC&includeNsfw=false"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data if isinstance(data, list) else []
-                logger.warning(f"get_trending_tokens HTTP {resp.status}")
-                return []
-        except Exception as e:
-            logger.error(f"get_trending_tokens error: {e}")
-            return []
+    async def start_stream(self):
+        """Connect and stream events. Auto-reconnects with exponential backoff."""
+        self._running = True
+        while self._running:
+            try:
+                logger.info("Connecting to PumpPortal websocket...")
+                async with websockets.connect(
+                    PUMPPORTAL_WS,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    self._ws = ws
+                    self._reconnect_delay = 5  # Reset on successful connect
 
-    async def get_token_detail(self, mint: str) -> dict | None:
-        """Fetch detailed info for a single token."""
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/coins/{mint}"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
-        except Exception as e:
-            logger.error(f"get_token_detail {mint}: {e}")
-            return None
+                    await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    await ws.send(json.dumps({"method": "subscribeMigration"}))
 
-    async def get_token_trades(self, mint: str, limit: int = 50) -> list[dict]:
-        """Fetch recent trades for a token."""
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/trades/all/{mint}?limit={limit}&minimumSize=0"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data if isinstance(data, list) else []
-                return []
-        except Exception as e:
-            logger.error(f"get_token_trades {mint}: {e}")
-            return []
+                    logger.info("PumpPortal connected. Streaming new tokens + migrations...")
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            data = json.loads(raw)
+                            await self._handle_message(data)
+                        except Exception as e:
+                            logger.error(f"Message handler error: {e}")
+
+            except (ConnectionClosed, WebSocketException) as e:
+                logger.warning(f"WS disconnected: {e}. Reconnecting in {self._reconnect_delay}s...")
+            except Exception as e:
+                logger.error(f"WS error: {e}. Reconnecting in {self._reconnect_delay}s...")
+
+            if self._running:
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+
+    async def _handle_message(self, data: dict):
+        """Route messages to callbacks."""
+        tx_type = data.get("txType", "")
+
+        if tx_type == "create" or ("mint" in data and "name" in data):
+            if self.on_new_token:
+                await self.on_new_token(data)
+
+        elif tx_type == "migrate" or "raydiumPool" in data:
+            if self.on_migration:
+                await self.on_migration(data)
+
+    async def subscribe_token_trades(self, mint: str):
+        if self._ws and not self._ws.closed:
+            await self._ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+
+    async def unsubscribe_token_trades(self, mint: str):
+        if self._ws and not self._ws.closed:
+            await self._ws.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [mint]}))
+
+    # ── Dexscreener ───────────────────────────────────────────────────────────
 
     async def get_dexscreener_data(self, mint: str) -> dict | None:
-        """Fetch price/volume data from Dexscreener."""
         try:
             session = await self._get_session()
             url = f"{DEXSCREENER_API}/tokens/{mint}"
@@ -99,29 +115,106 @@ class PumpFunAPI:
                 if resp.status == 200:
                     data = await resp.json()
                     pairs = data.get("pairs", [])
-                    # Filter to pump.fun / raydium pairs only
-                    pumpfun_pairs = [
-                        p for p in pairs
-                        if p.get("dexId") in ("pumpfun", "raydium")
-                        and p.get("chainId") == "solana"
-                    ]
-                    if pumpfun_pairs:
-                        return pumpfun_pairs[0]
+                    for dex_id in ("pumpfun", "raydium"):
+                        for p in pairs:
+                            if p.get("dexId") == dex_id and p.get("chainId") == "solana":
+                                return p
                     return pairs[0] if pairs else None
                 return None
         except Exception as e:
-            logger.error(f"get_dexscreener_data {mint}: {e}")
+            logger.error(f"Dexscreener {mint}: {e}")
             return None
 
-    async def get_holder_data(self, mint: str) -> dict:
-        """Fetch holder distribution data."""
-        try:
-            session = await self._get_session()
-            url = f"{PUMPFUN_BASE}/coins/{mint}/holders"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.json() or {}
-                return {}
-        except Exception as e:
-            logger.error(f"get_holder_data {mint}: {e}")
-            return {}
+    # ── Token parsing ─────────────────────────────────────────────────────────
+
+    def parse_new_token_event(self, data: dict) -> dict:
+        """
+        Normalise a PumpPortal 'create' websocket event into a standard token dict.
+        PumpPortal fields: mint, name, symbol, description, image_uri,
+        twitter, website, creator/traderPublicKey, initialBuy, solAmount,
+        marketCapSol, vSolInBondingCurve, vTokensInBondingCurve
+        """
+        now = time.time()
+        sol_price_usd = 150.0  # Fallback; enriched from Dexscreener
+
+        mint = data.get("mint", "")
+        sol_amount = float(data.get("solAmount", 0) or 0)
+        market_cap_sol = float(data.get("marketCapSol", 0) or 0)
+
+        return {
+            "mint": mint,
+            "name": data.get("name", "Unknown"),
+            "symbol": data.get("symbol", "???"),
+            "dev_wallet": data.get("traderPublicKey") or data.get("creator", ""),
+            "image_uri": data.get("image_uri", ""),
+            "twitter": data.get("twitter", ""),
+            "telegram": data.get("telegram", ""),
+            "website": data.get("website", ""),
+            "description": data.get("description", ""),
+            "age_seconds": 0,
+            "created_at": now,
+            "market_cap_usd": market_cap_sol * sol_price_usd,
+            "market_cap_sol": market_cap_sol,
+            "price_usd": 0.0,
+            "price_change_5m": 0.0,
+            "price_change_1h": 0.0,
+            "price_change_24h": 0.0,
+            "volume_5m_usd": sol_amount * sol_price_usd,
+            "volume_1h_usd": 0.0,
+            "volume_24h_usd": 0.0,
+            "tx_buys_5m": 1 if float(data.get("initialBuy", 0) or 0) > 0 else 0,
+            "tx_sells_5m": 0,
+            "is_dex_listed": False,
+            "is_migrated": False,
+            "total_sol_fees": sol_amount,
+            "top10_holders_pct": 0.0,
+            "insider_pct": 0.0,
+            "snipers_pct": 0.0,
+            "bundles_pct": 0.0,
+            "dev_holding_pct": 0.0,
+            "pro_holders_count": 0,
+            "launchpad": "pumpfun",
+            "rug_status": "Unknown",
+            "rug_score": 0,
+            "rug_mintable": True,
+            "rug_freezable": True,
+            "rug_risks": [],
+            "dev_deploy_count": 0,
+            "dev_migration_count": 0,
+            "dev_success_ratio": 0.0,
+            "runner_score": 0,
+            "runner_reasons": [],
+            "filter_category": None,
+        }
+
+    def parse_migration_event(self, data: dict) -> dict:
+        """Normalise a migration event."""
+        token = self.parse_new_token_event(data)
+        token["is_migrated"] = True
+        token["is_dex_listed"] = True
+        return token
+
+    def enrich_with_dexscreener(self, token: dict, dex: dict) -> dict:
+        """Merge live Dexscreener price/volume data into token dict."""
+        if not dex:
+            return token
+        pc = dex.get("priceChange", {})
+        vol = dex.get("volume", {})
+        txns = dex.get("txns", {}).get("m5", {})
+
+        token["price_usd"] = float(dex.get("priceUsd", 0) or 0)
+        token["price_change_5m"] = float(pc.get("m5", 0) or 0)
+        token["price_change_1h"] = float(pc.get("h1", 0) or 0)
+        token["price_change_24h"] = float(pc.get("h24", 0) or 0)
+        token["volume_5m_usd"] = float(vol.get("m5", 0) or 0)
+        token["volume_1h_usd"] = float(vol.get("h1", 0) or 0)
+        token["volume_24h_usd"] = float(vol.get("h24", 0) or 0)
+        token["tx_buys_5m"] = int(txns.get("buys", 0) or 0)
+        token["tx_sells_5m"] = int(txns.get("sells", 0) or 0)
+        token["is_dex_listed"] = True
+
+        mc = float(dex.get("marketCap", 0) or 0)
+        if mc > 0:
+            token["market_cap_usd"] = mc
+
+        return token

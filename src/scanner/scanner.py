@@ -1,9 +1,8 @@
 import asyncio
 import logging
 import time
-from collections import deque
 
-from pumpfun.api import PumpFunAPI
+from pumpfun.api import PumpPortalClient
 from rugcheck.rugcheck import RugCheckAPI
 from devstats.devstats import DevStatsModule
 from filters.filters import TokenFilters
@@ -11,20 +10,30 @@ from scanner.scoring import RunnerScorer
 
 logger = logging.getLogger("scanner")
 
-# How long to keep a token in the "already alerted" cache (seconds)
-ALERT_COOLDOWN = 3600  # 1 hour
+ALERT_COOLDOWN = 3600       # Don't re-alert same token for 1 hour
+DEX_FETCH_DELAY = 3.0       # Wait a few seconds before hitting Dexscreener (token needs to index)
+MAX_QUEUE_SIZE = 200
 
 
 class TokenScanner:
     def __init__(self):
-        self.pump = PumpFunAPI()
+        self.pump = PumpPortalClient()
         self.rug = RugCheckAPI()
         self.dev = DevStatsModule()
         self.scorer = RunnerScorer()
         self.filters = TokenFilters()
 
-        # mint -> timestamp of last alert
         self._alerted: dict[str, float] = {}
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+        self._alert_callbacks: list = []
+
+        # Wire up PumpPortal callbacks
+        self.pump.on_new_token = self._on_new_token
+        self.pump.on_migration = self._on_migration
+
+    def add_alert_callback(self, cb):
+        """Register a callback that receives a token dict when an alert fires."""
+        self._alert_callbacks.append(cb)
 
     def _already_alerted(self, mint: str) -> bool:
         ts = self._alerted.get(mint)
@@ -36,193 +45,105 @@ class TokenScanner:
         self._alerted[mint] = time.time()
         # Prune old entries
         now = time.time()
-        self._alerted = {
-            k: v for k, v in self._alerted.items()
-            if now - v < ALERT_COOLDOWN * 2
-        }
+        self._alerted = {k: v for k, v in self._alerted.items() if now - v < ALERT_COOLDOWN * 2}
 
-    async def _normalise_token(self, raw: dict) -> dict:
-        """Convert raw Pump.fun API response to a standardised dict."""
-        now = time.time()
-        created = raw.get("created_timestamp", now * 1000) / 1000
-        age_s = now - created
+    # ── Websocket event handlers ──────────────────────────────────────────────
 
-        mint = raw.get("mint", "")
-        market_cap = float(raw.get("usd_market_cap", 0) or 0)
-        name = raw.get("name", "Unknown")
-        symbol = raw.get("symbol", "???")
-        dev_wallet = raw.get("creator", "")
-        image_uri = raw.get("image_uri", "")
-        twitter = raw.get("twitter", "")
-        website = raw.get("website", "")
-        description = raw.get("description", "")
-        is_migrated = raw.get("raydium_pool") is not None
+    async def _on_new_token(self, data: dict):
+        """Called instantly when PumpPortal fires a new token event."""
+        mint = data.get("mint", "")
+        if not mint or self._already_alerted(mint):
+            return
+        try:
+            self._queue.put_nowait(("new", data))
+        except asyncio.QueueFull:
+            logger.warning("Token queue full, dropping event")
 
-        # Fetch Dexscreener for price/volume
-        dex = await self.pump.get_dexscreener_data(mint)
-        price_change_5m = 0.0
-        price_change_1h = 0.0
-        price_change_24h = 0.0
-        vol_5m = 0.0
-        vol_1h = 0.0
-        vol_24h = 0.0
-        tx_buys_5m = 0
-        tx_sells_5m = 0
-        is_dex_listed = False
-        price_usd = 0.0
+    async def _on_migration(self, data: dict):
+        """Called when a token migrates to Raydium."""
+        mint = data.get("mint", "")
+        if not mint or self._already_alerted(mint):
+            return
+        try:
+            self._queue.put_nowait(("migrate", data))
+        except asyncio.QueueFull:
+            logger.warning("Migration queue full, dropping event")
 
-        if dex:
-            is_dex_listed = True
-            pc = dex.get("priceChange", {})
-            price_change_5m = float(pc.get("m5", 0) or 0)
-            price_change_1h = float(pc.get("h1", 0) or 0)
-            price_change_24h = float(pc.get("h24", 0) or 0)
-            vol = dex.get("volume", {})
-            vol_5m = float(vol.get("m5", 0) or 0)
-            vol_1h = float(vol.get("h1", 0) or 0)
-            vol_24h = float(vol.get("h24", 0) or 0)
-            txns = dex.get("txns", {}).get("m5", {})
-            tx_buys_5m = int(txns.get("buys", 0) or 0)
-            tx_sells_5m = int(txns.get("sells", 0) or 0)
-            price_usd = float(dex.get("priceUsd", 0) or 0)
-            market_cap = float(dex.get("marketCap", market_cap) or market_cap)
+    # ── Main loops ────────────────────────────────────────────────────────────
 
-        # Holder data (best-effort)
-        top10_pct = float(raw.get("top_holders_pct", 0) or 0)
-        insider_pct = float(raw.get("insider_pct", 0) or 0)
-        snipers_pct = float(raw.get("snipers_pct", 0) or 0)
-        bundles_pct = float(raw.get("bundles_pct", 0) or 0)
-        dev_holding_pct = float(raw.get("dev_holding_pct", 0) or 0)
-        pro_holders = int(raw.get("pro_holders_count", 0) or 0)
-        total_sol_fees = float(raw.get("total_sol_fees", raw.get("virtual_sol_reserves", 0)) or 0)
-
-        return {
-            "mint": mint,
-            "name": name,
-            "symbol": symbol,
-            "dev_wallet": dev_wallet,
-            "image_uri": image_uri,
-            "twitter": twitter,
-            "website": website,
-            "description": description,
-            "age_seconds": age_s,
-            "market_cap_usd": market_cap,
-            "price_usd": price_usd,
-            "price_change_5m": price_change_5m,
-            "price_change_1h": price_change_1h,
-            "price_change_24h": price_change_24h,
-            "volume_5m_usd": vol_5m,
-            "volume_1h_usd": vol_1h,
-            "volume_24h_usd": vol_24h,
-            "tx_buys_5m": tx_buys_5m,
-            "tx_sells_5m": tx_sells_5m,
-            "is_dex_listed": is_dex_listed,
-            "is_migrated": is_migrated,
-            "top10_holders_pct": top10_pct,
-            "insider_pct": insider_pct,
-            "snipers_pct": snipers_pct,
-            "bundles_pct": bundles_pct,
-            "dev_holding_pct": dev_holding_pct,
-            "pro_holders_count": pro_holders,
-            "total_sol_fees": total_sol_fees,
-            "launchpad": "pumpfun",
-            "rug_status": "Unknown",
-            "rug_score": 0,
-            "rug_mintable": True,
-            "rug_freezable": True,
-            "rug_risks": [],
-            "dev_deploy_count": 0,
-            "dev_migration_count": 0,
-            "dev_success_ratio": 0.0,
-            "runner_score": 0,
-            "runner_reasons": [],
-            "filter_category": None,
-        }
-
-    async def _enrich_token(self, token: dict) -> dict:
-        """Add rugcheck + dev stats to a normalised token."""
-        mint = token["mint"]
-        dev_wallet = token["dev_wallet"]
-
-        # Rugcheck + dev in parallel
-        rug_task = asyncio.create_task(self.rug.check_token(mint))
-        dev_task = asyncio.create_task(self.dev.get_dev_stats(dev_wallet))
-
-        rug_report, dev_stats = await asyncio.gather(rug_task, dev_task)
-
-        token["rug_status"] = rug_report.get("status", "Unknown")
-        token["rug_score"] = rug_report.get("score", 0)
-        token["rug_mintable"] = rug_report.get("mintable", True)
-        token["rug_freezable"] = rug_report.get("freezable", True)
-        token["rug_risks"] = rug_report.get("risks", [])
-
-        token["dev_deploy_count"] = dev_stats.get("deploy_count", 0)
-        token["dev_migration_count"] = dev_stats.get("migration_count", 0)
-        token["dev_success_ratio"] = dev_stats.get("success_ratio", 0.0)
-
-        return token
-
-    async def scan(self) -> list[dict]:
+    async def start(self):
         """
-        Full scan cycle: fetch tokens, filter, enrich, score, return alerts.
+        Start both the websocket stream and the processing worker concurrently.
+        This runs forever (until cancelled).
         """
-        alerts: list[dict] = []
-
-        # Fetch both new and trending
-        new_tokens, trending = await asyncio.gather(
-            self.pump.get_new_tokens(50),
-            self.pump.get_trending_tokens(50),
+        logger.info("Starting TokenScanner (PumpPortal websocket mode)...")
+        await asyncio.gather(
+            self.pump.start_stream(),
+            self._process_queue(),
         )
 
-        # Deduplicate by mint
-        seen: dict[str, dict] = {}
-        for raw in new_tokens + trending:
-            mint = raw.get("mint", "")
-            if mint and mint not in seen:
-                seen[mint] = raw
+    async def _process_queue(self):
+        """Worker that processes queued token events one at a time."""
+        logger.info("Token processing worker started.")
+        while True:
+            try:
+                event_type, data = await self._queue.get()
+                await self._handle_event(event_type, data)
+                self._queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Queue processing error: {e}", exc_info=True)
 
-        logger.info(f"Fetched {len(seen)} unique tokens")
-
-        # Process in batches to avoid hammering APIs
-        batch_size = 5
-        mints = list(seen.keys())
-
-        for i in range(0, len(mints), batch_size):
-            batch = mints[i: i + batch_size]
-            tasks = [self._process_token(seen[m]) for m in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, dict):
-                    alerts.append(res)
-            await asyncio.sleep(0.5)
-
-        logger.info(f"Scan complete. {len(alerts)} alert(s) generated.")
-        return alerts
-
-    async def _process_token(self, raw: dict) -> dict | None:
-        """Normalise, filter, enrich, score a single token."""
+    async def _handle_event(self, event_type: str, data: dict):
+        """Process a single token event from the queue."""
         try:
-            mint = raw.get("mint", "")
-            if not mint:
-                return None
-            if self._already_alerted(mint):
-                return None
+            if event_type == "new":
+                token = self.pump.parse_new_token_event(data)
+            else:
+                token = self.pump.parse_migration_event(data)
 
-            token = await self._normalise_token(raw)
+            mint = token["mint"]
+            if not mint:
+                return
+
+            # Small delay so Dexscreener has time to index the token
+            await asyncio.sleep(DEX_FETCH_DELAY)
+
+            # Enrich with Dexscreener price/volume
+            dex = await self.pump.get_dexscreener_data(mint)
+            if dex:
+                token = self.pump.enrich_with_dexscreener(token, dex)
+
+            # Update age
+            token["age_seconds"] = time.time() - token["created_at"]
 
             # Filter check
             category = self.filters.classify(token)
             if category is None:
-                return None
+                logger.debug(f"Filtered out: {token['name']} ({mint[:8]}...)")
+                return
             token["filter_category"] = category
 
-            # Enrich with rugcheck + dev stats
-            token = await self._enrich_token(token)
+            # Safety + dev stats in parallel
+            rug_task = asyncio.create_task(self.rug.check_token(mint))
+            dev_task = asyncio.create_task(self.dev.get_dev_stats(token["dev_wallet"]))
+            rug_report, dev_stats = await asyncio.gather(rug_task, dev_task)
 
-            # Safety gate: don't alert on Danger rug status
+            token["rug_status"] = rug_report.get("status", "Unknown")
+            token["rug_score"] = rug_report.get("score", 0)
+            token["rug_mintable"] = rug_report.get("mintable", True)
+            token["rug_freezable"] = rug_report.get("freezable", True)
+            token["rug_risks"] = rug_report.get("risks", [])
+
+            token["dev_deploy_count"] = dev_stats.get("deploy_count", 0)
+            token["dev_migration_count"] = dev_stats.get("migration_count", 0)
+            token["dev_success_ratio"] = dev_stats.get("success_ratio", 0.0)
+
+            # Hard block on Danger rug
             if token["rug_status"] == "Danger":
-                logger.debug(f"Skipping {mint}: rug Danger")
-                return None
+                logger.debug(f"Blocked (rug Danger): {mint[:8]}...")
+                return
 
             # Runner score
             passes, score, reasons = self.scorer.passes(token)
@@ -230,13 +151,21 @@ class TokenScanner:
             token["runner_reasons"] = reasons
 
             if not passes:
-                logger.debug(f"Skipping {mint}: score {score} below threshold")
-                return None
+                logger.debug(f"Score {score} too low: {token['name']} ({mint[:8]}...)")
+                return
 
             self._mark_alerted(mint)
-            logger.info(f"ALERT: {token['name']} ({token['symbol']}) score={score} cat={category}")
-            return token
+            logger.info(
+                f"🚨 ALERT: {token['name']} (${token['symbol']}) "
+                f"score={score} cat={category} mc=${token['market_cap_usd']:,.0f}"
+            )
+
+            # Fire all registered callbacks
+            for cb in self._alert_callbacks:
+                try:
+                    await cb(token)
+                except Exception as e:
+                    logger.error(f"Alert callback error: {e}")
 
         except Exception as e:
-            logger.error(f"_process_token error: {e}", exc_info=True)
-            return None
+            logger.error(f"_handle_event error: {e}", exc_info=True)
