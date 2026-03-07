@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Callable
 
+import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -11,7 +12,12 @@ logger = logging.getLogger("pumpfun")
 
 PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
 
-# Approximate SOL price — updated from trade events
+# Pump.fun REST API for existing coins
+PUMPFUN_REST = "https://frontend-api.pump.fun"
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# Approximate SOL price — updated periodically
 _SOL_PRICE_USD = 150.0
 
 
@@ -27,15 +33,14 @@ def get_sol_price() -> float:
 
 class PumpPortalClient:
     """
-    Pure PumpPortal websocket client.
-    - Streams new token creations instantly
-    - Streams migration events
-    - Tracks live trades per token for price/volume data
-    No external HTTP APIs needed.
+    Combined PumpPortal websocket + Pump.fun REST polling client.
+    - Websocket: streams brand new token creations + migrations instantly
+    - REST poll: catches existing/already-running coins every 60s
     """
 
     def __init__(self):
         self._ws = None
+        self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._reconnect_delay = 5
 
@@ -43,10 +48,17 @@ class PumpPortalClient:
         self.on_new_token: Callable | None = None
         self.on_migration: Callable | None = None
 
-        # Per-token trade tracking: mint -> {buys, sells, volume_sol, last_price}
+        # Per-token trade tracking
         self._trade_data: dict[str, dict] = {}
-        # Subscribed trade mints
         self._subscribed_trades: set[str] = set()
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+        return self._session
 
     async def close(self):
         self._running = False
@@ -55,6 +67,88 @@ class PumpPortalClient:
                 await self._ws.close()
             except Exception:
                 pass
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ── REST: fetch existing coins ────────────────────────────────────────────
+
+    async def get_existing_coins(self, limit: int = 50, sort: str = "last_trade_timestamp") -> list[dict]:
+        """
+        Fetch currently active coins from Pump.fun REST API.
+        sort options: last_trade_timestamp, created_timestamp, market_cap
+        """
+        try:
+            session = await self._get_session()
+            url = f"{PUMPFUN_REST}/coins?offset=0&limit={limit}&sort={sort}&order=DESC&includeNsfw=false"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, list) else []
+                logger.warning(f"REST coins HTTP {resp.status}")
+                return []
+        except Exception as e:
+            logger.error(f"get_existing_coins error: {e}")
+            return []
+
+    def normalise_rest_coin(self, coin: dict) -> dict:
+        """Convert a Pump.fun REST coin response into the same format as a websocket event."""
+        now = time.time()
+        created_ts = coin.get("created_timestamp", now * 1000)
+        created_at = created_ts / 1000 if created_ts > 1e10 else created_ts
+        age_minutes = (now - created_at) / 60
+
+        sol_price = get_sol_price()
+        usd_mc = float(coin.get("usd_market_cap", 0) or 0)
+        v_sol = float(coin.get("virtual_sol_reserves", 0) or 0)
+
+        return {
+            "mint": coin.get("mint", ""),
+            "name": coin.get("name", "Unknown"),
+            "symbol": coin.get("symbol", "???"),
+            "dev_wallet": coin.get("creator", ""),
+            "image_uri": coin.get("image_uri", ""),
+            "twitter": coin.get("twitter", ""),
+            "telegram": coin.get("telegram", ""),
+            "website": coin.get("website", ""),
+            "description": coin.get("description", ""),
+            "age_seconds": (now - created_at),
+            "created_at": created_at,
+            "receipt_age_minutes": age_minutes,
+            "market_cap_usd": usd_mc,
+            "market_cap_sol": usd_mc / sol_price if sol_price > 0 else 0,
+            "price_usd": float(coin.get("price", 0) or 0),
+            "price_change_5m": 0.0,
+            "price_change_1h": 0.0,
+            "price_change_24h": 0.0,
+            "volume_5m_usd": 0.0,
+            "volume_1h_usd": 0.0,
+            "volume_24h_usd": 0.0,
+            "tx_buys_5m": 0,
+            "tx_sells_5m": 0,
+            "is_dex_listed": coin.get("raydium_pool") is not None,
+            "is_migrated": coin.get("raydium_pool") is not None,
+            "total_sol_fees": v_sol,
+            "top10_holders_pct": 0.0,
+            "insider_pct": 0.0,
+            "snipers_pct": 0.0,
+            "bundles_pct": 0.0,
+            "dev_holding_pct": 0.0,
+            "pro_holders_count": 0,
+            "launchpad": "pumpfun",
+            "rug_status": "Unknown",
+            "rug_score": 0,
+            "rug_mintable": False,
+            "rug_freezable": False,
+            "rug_risks": [],
+            "dev_deploy_count": 0,
+            "dev_migration_count": 0,
+            "dev_success_ratio": 0.0,
+            "runner_score": 0,
+            "runner_reasons": [],
+            "filter_category": None,
+            "_receipt_time": now,
+            "_source": "rest_poll",
+        }
 
     # ── Websocket stream ──────────────────────────────────────────────────────
 
