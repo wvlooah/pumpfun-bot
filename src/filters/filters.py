@@ -88,24 +88,7 @@ class TokenFilters:
             logger.debug(f"❌ Wrong launchpad: {launchpad}")
             return None
 
-        # ── Migrated ──────────────────────────────────────────────────────────
-        if is_migrated:
-            f = FILTER_MIGRATED
-            if (
-                _in_range(market_cap_usd, f["MARKET_CAP_USD"])
-                and _in_range(receipt_age_min, f["TOKEN_AGE_MINUTES"])
-                and _in_range(top10_pct, f["TOP10_HOLDERS_PCT"])
-                and _in_range(insider_pct, f["INSIDER_PCT"])
-                and _in_range(snipers_pct, f["SNIPERS_PCT"])
-                and _in_range(bundles_pct, f["BUNDLES_PCT"])
-                and _in_range(dev_pct, f["DEV_HOLDING_PCT"])
-                and _in_range(sol_fees, f["TOTAL_SOL_FEES"])
-                and pro_holders >= f["PRO_HOLDERS_COUNT"]["from"]
-            ):
-                logger.info(f"✅ MIGRATED: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m")
-                return "migrated"
-
-        # ── Soon to Migrate ───────────────────────────────────────────────────
+        # ── Soon to Migrate (FIRST PRIORITY) ─────────────────────────────────
         f = FILTER_SOON_MIGRATE
         if (
             _in_range(market_cap_usd, f["MARKET_CAP_USD"])
@@ -122,7 +105,24 @@ class TokenFilters:
             logger.info(f"✅ SOON_MIGRATE: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m")
             return "soon_migrate"
 
-        # ── New Pair ──────────────────────────────────────────────────────────
+        # ── Migrated (SECOND PRIORITY) ────────────────────────────────────────
+        if is_migrated:
+            f = FILTER_MIGRATED
+            if (
+                _in_range(market_cap_usd, f["MARKET_CAP_USD"])
+                and _in_range(receipt_age_min, f["TOKEN_AGE_MINUTES"])
+                and _in_range(top10_pct, f["TOP10_HOLDERS_PCT"])
+                and _in_range(insider_pct, f["INSIDER_PCT"])
+                and _in_range(snipers_pct, f["SNIPERS_PCT"])
+                and _in_range(bundles_pct, f["BUNDLES_PCT"])
+                and _in_range(dev_pct, f["DEV_HOLDING_PCT"])
+                and _in_range(sol_fees, f["TOTAL_SOL_FEES"])
+                and pro_holders >= f["PRO_HOLDERS_COUNT"]["from"]
+            ):
+                logger.info(f"✅ MIGRATED: {token.get('name')} mc=${market_cap_usd:,.0f} age={receipt_age_min:.1f}m")
+                return "migrated"
+
+        # ── New Pair (THIRD PRIORITY) ─────────────────────────────────────────
         f = FILTER_NEW_PAIRS
         if (
             _in_range(market_cap_usd, f["MARKET_CAP_USD"])

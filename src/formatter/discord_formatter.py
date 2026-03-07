@@ -72,9 +72,10 @@ class DiscordFormatter:
 
         color = CATEGORY_COLORS.get(category, 0x7289DA)
         cat_label = CATEGORY_LABELS.get(category, "📊 TOKEN")
+        tier = token.get("runner_tier", "")
 
         # ── Title ─────────────────────────────────────────────────────────────
-        title = f"{name}  (${symbol})"
+        title = f"{tier}  |  {name}  (${symbol})" if tier else f"{name}  (${symbol})"
         embed = discord.Embed(
             title=title,
             description=f"`{mint}`",

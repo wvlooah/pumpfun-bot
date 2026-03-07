@@ -185,11 +185,12 @@ class PumpPortalClient:
         sol_price = get_sol_price()
         mc_usd = mc_sol * sol_price
 
-        # Momentum criteria — any of these signal a hot token:
+        # Early detection thresholds — catch runners before they fully pump
         is_hot = (
-            (total >= 5 and buy_ratio >= 0.65 and volume_sol >= 0.5)   # Strong buy pressure
-            or (total >= 10 and volume_sol >= 1.0)                       # High tx volume
-            or (buys >= 8 and volume_sol >= 2.0)                         # Heavy buying
+            (total >= 8  and buy_ratio >= 0.70 and volume_sol >= 1.0)    # Early strong buying
+            or (total >= 15 and volume_sol >= 3.0)                        # Growing activity
+            or (buys >= 10 and volume_sol >= 2.0 and buy_ratio >= 0.65)  # Sustained buy pressure
+            or (mc_sol >= 100 and total >= 8  and buy_ratio >= 0.70)     # Big cap actively bought
         )
 
         if is_hot and self.on_momentum_spike:
