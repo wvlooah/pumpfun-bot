@@ -1,4 +1,4 @@
-"""Discord embed — shows every data field with its source labeled."""
+"""Discord embed — full data display with narrative."""
 
 import logging
 from datetime import datetime, timezone
@@ -12,22 +12,14 @@ DEXSCREENER_URL = "https://dexscreener.com/solana"
 RUGCHECK_URL   = "https://rugcheck.xyz/tokens"
 BUBBLEMAPS_URL = "https://app.bubblemaps.io/sol/token"
 
-CATEGORY_LABELS = {
-    "new_pair":     "🆕 NEW PAIR",
-    "soon_migrate": "⚡ SOON TO MIGRATE",
-    "migrated":     "🚀 MIGRATED",
-}
-CATEGORY_COLORS = {
-    "new_pair":     0x00FF99,
-    "soon_migrate": 0xFFAA00,
-    "migrated":     0xFF4400,
-}
+CATEGORY_COLORS = {"soon_migrate": 0xFFAA00, "migrated": 0xFF4400}
+CATEGORY_LABELS = {"soon_migrate": "⚡ SOON TO MIGRATE", "migrated": "🚀 MIGRATED"}
 RUG_EMOJI = {"Good": "✅", "Warn": "⚠️", "Danger": "🚨", "Unknown": "❓"}
 
-def _pct(v, show_sign=True) -> str:
+def _pct(v, sign=True) -> str:
     if v is None or v == 0: return "N/A"
-    sign = "+" if v > 0 and show_sign else ""
-    return f"{sign}{v:.1f}%"
+    s = "+" if v > 0 and sign else ""
+    return f"{s}{v:.1f}%"
 
 def _usd(v) -> str:
     if not v: return "N/A"
@@ -42,10 +34,10 @@ def _age(s: float) -> str:
     return f"{s//3600}h {(s%3600)//60}m"
 
 def _short(w: str) -> str:
-    return f"{w[:6]}...{w[-4:]}" if len(w) > 16 else w
+    return f"{w[:6]}...{w[-4:]}" if len(w) > 16 else (w or "Unknown")
 
-def _na(v) -> str:
-    return str(v) if v else "N/A"
+def _bool(v, true_str="✅ Yes", false_str="❌ No") -> str:
+    return true_str if v else false_str
 
 
 class DiscordFormatter:
@@ -53,11 +45,12 @@ class DiscordFormatter:
         name     = token.get("name", "Unknown")
         symbol   = token.get("symbol", "???")
         mint     = token.get("mint", "")
-        category = token.get("filter_category", "new_pair")
+        category = token.get("filter_category", "soon_migrate")
         score    = token.get("runner_score", 0)
         tier     = token.get("runner_tier", "")
         reasons  = token.get("runner_reasons", [])
         enriched = token.get("mobula_enriched", False)
+        narrative= token.get("narrative", "")
 
         color     = CATEGORY_COLORS.get(category, 0x7289DA)
         cat_label = CATEGORY_LABELS.get(category, "📊 TOKEN")
@@ -81,75 +74,64 @@ class DiscordFormatter:
             inline=False,
         )
 
-        # ── Market (Mobula + PumpPortal) ──────────────────────────────────────
+        # ── Narrative ─────────────────────────────────────────────────────────
+        if narrative:
+            embed.add_field(name="💬 Analysis", value=narrative, inline=False)
+
+        # ── Market ────────────────────────────────────────────────────────────
         vol_change = token.get("mobula_vol_change_24h", 0) or 0
-        vol_accel  = token.get("mobula_vol_accel", False)
-        vol_accel_str = f" ({vol_change:+.0f}% vs yday {'🚀' if vol_accel else ''})" if vol_change else ""
+        vol_str    = f" ({vol_change:+.0f}% vs yday)" if vol_change else ""
         embed.add_field(
-            name="📊 Market  *(Mobula)*",
+            name="📊 Market",
             value=(
                 f"**MC:** {_usd(token.get('market_cap_usd'))}\n"
                 f"**Liquidity:** {_usd(token.get('liquidity_usd'))}\n"
-                f"**Vol 24h:** {_usd(token.get('volume_24h_usd'))}{vol_accel_str}\n"
+                f"**Vol 24h:** {_usd(token.get('volume_24h_usd'))}{vol_str}\n"
                 f"**Vol 5m:** {_usd(token.get('volume_5m_usd'))}\n"
                 f"**Age:** {_age(token.get('age_seconds', 0))}\n"
-                f"**Migrated:** {'✅' if token.get('is_migrated') else '❌'}"
+                f"**Migrated:** {_bool(token.get('is_migrated'))}"
             ),
             inline=True,
         )
 
-        # ── Price change (Mobula) ─────────────────────────────────────────────
-        organic = token.get("mobula_organic_ratio", None)
-        organic_str = f"\n**Organic Vol:** {organic*100:.0f}%" if organic is not None and enriched else ""
+        # ── Price ──────────────────────────────────────────────────────────────
+        organic = token.get("mobula_organic_ratio")
+        org_str = f"\n**Organic Vol:** {organic*100:.0f}%" if organic and enriched else ""
         embed.add_field(
-            name="📈 Price  *(Mobula)*",
+            name="📈 Price",
             value=(
                 f"**1h:** {_pct(token.get('price_change_1h'))}\n"
                 f"**24h:** {_pct(token.get('price_change_24h'))}\n"
-                f"**7d:** {_pct(token.get('mobula_price_change_7d'))}"
-                + organic_str
+                f"**Floor Held:** {_bool(token.get('price_floor_held'))}"
+                + org_str
             ),
             inline=True,
         )
 
-        # ── Live trades (PumpPortal) ──────────────────────────────────────────
+        # ── Live Trades ───────────────────────────────────────────────────────
         buys  = token.get("tx_buys_5m", 0) or 0
         sells = token.get("tx_sells_5m", 0) or 0
         total = buys + sells
-        ratio = f"{buys/total*100:.0f}% buys" if total > 0 else "N/A"
+        ratio = f"{buys/total*100:.0f}%" if total > 0 else "N/A"
+        bonding_rate = token.get("bonding_fill_rate", 0) or 0
         embed.add_field(
-            name="⚡ Live 60s  *(PumpPortal)*",
+            name="⚡ Live Activity",
             value=(
-                f"**Buys:** {buys}\n"
-                f"**Sells:** {sells}\n"
-                f"**Pressure:** {ratio}\n"
-                f"**SOL Bonded:** {token.get('total_sol_fees', 0):.2f} SOL"
+                f"**Buys:** {buys}  **Sells:** {sells}\n"
+                f"**Buy Ratio:** {ratio}\n"
+                f"**Repeat Buyers:** {_bool(token.get('repeat_buy_signal'))}\n"
+                f"**Bonding Rate:** {bonding_rate:.2f} SOL/s\n"
+                f"**SOL Bonded:** {token.get('total_sol_fees', 0):.2f}"
             ),
             inline=True,
         )
 
-        # ── Holder Health (RugCheck) ──────────────────────────────────────────
-        rug_status = token.get("rug_status", "Unknown")
-        risks_list = (token.get("rug_risks") or ["None"])[:3]
-        risks_str  = ", ".join(risks_list)
-        embed.add_field(
-            name="🛡️ Security  *(RugCheck)*",
-            value=(
-                f"**Status:** {RUG_EMOJI.get(rug_status,'❓')} {rug_status} ({token.get('rug_score',0)})\n"
-                f"**Mintable:** {'❌ YES' if token.get('rug_mintable') else '✅ No'}\n"
-                f"**Freezable:** {'❌ YES' if token.get('rug_freezable') else '✅ No'}\n"
-                f"**LP Locked:** {'✅ Yes' if token.get('lp_locked') else '❌ No'}\n"
-                f"**Risks:** {risks_str}"
-            ),
-            inline=True,
-        )
-
-        # ── Holder distribution (RugCheck) ────────────────────────────────────
+        # ── Holder health ──────────────────────────────────────────────────────
         top10   = token.get("top10_holders_pct", 0) or 0
         dev     = token.get("dev_holding_pct", 0) or 0
         insider = token.get("insider_pct", 0) or 0
         embed.add_field(
-            name="👥 Holders  *(RugCheck)*",
+            name="👥 Holders",
             value=(
                 f"**Top 10:** {f'{top10:.1f}%' if top10 else 'N/A'}\n"
                 f"**Dev:** {f'{dev:.1f}%' if dev else 'N/A'}\n"
@@ -158,11 +140,42 @@ class DiscordFormatter:
             inline=True,
         )
 
-        # ── Dev wallet ───────────────────────────────────────────────────────
-        dev_wallet = token.get("dev_wallet", "")
+        # ── Security ──────────────────────────────────────────────────────────
+        rug_status = token.get("rug_status", "Unknown")
+        lp_days    = token.get("lp_lock_days", 0) or 0
+        lp_str     = f"✅ {lp_days}d" if token.get("lp_locked") and lp_days else (
+                     "✅ Locked" if token.get("lp_locked") else "❌ No")
+        fee_pct    = token.get("transfer_fee_pct", 0) or 0
+        risks_str  = ", ".join((token.get("rug_risks") or ["None"])[:3])
+        embed.add_field(
+            name="🔍 Security",
+            value=(
+                f"**RugCheck:** {RUG_EMOJI.get(rug_status,'❓')} {rug_status}\n"
+                f"**Mintable:** {'❌ YES' if token.get('rug_mintable') else '✅ No'}\n"
+                f"**Freezable:** {'❌ YES' if token.get('rug_freezable') else '✅ No'}\n"
+                f"**Mutable Meta:** {'❌ YES' if token.get('metadata_mutable') else '✅ No'}\n"
+                f"**Transfer Fee:** {'❌ ' if fee_pct > 0 else ''}{fee_pct:.1f}%\n"
+                f"**LP Lock:** {lp_str}\n"
+                f"**Verified:** {'✅ Yes' if token.get('verified') else '❌ No'}\n"
+                f"**Risks:** {risks_str}"
+            ),
+            inline=True,
+        )
+
+        # ── Dev ───────────────────────────────────────────────────────────────
+        socials = []
+        if token.get("twitter"):
+            tw = token["twitter"]
+            if not tw.startswith("http"): tw = f"https://twitter.com/{tw.lstrip('@')}"
+            socials.append(f"[Twitter]({tw})")
+        if token.get("website"):
+            socials.append(f"[Website]({token['website']})")
         embed.add_field(
             name="👤 Dev",
-            value=f"`{_short(dev_wallet)}`" if dev_wallet else "Unknown",
+            value=(
+                f"`{_short(token.get('dev_wallet',''))}`\n"
+                + (" · ".join(socials) if socials else "No socials")
+            ),
             inline=True,
         )
 
@@ -173,14 +186,6 @@ class DiscordFormatter:
             f"[RugCheck]({RUGCHECK_URL}/{mint})",
             f"[Bubblemaps]({BUBBLEMAPS_URL}/{mint})",
         ]
-        if token.get("twitter"):
-            tw = token["twitter"]
-            if not tw.startswith("http"):
-                tw = f"https://twitter.com/{tw.lstrip('@')}"
-            links.append(f"[Twitter]({tw})")
-        if token.get("website"):
-            links.append(f"[Website]({token['website']})")
-
         embed.add_field(name="🔗 Links", value=" · ".join(links), inline=False)
 
         src = "✅ Mobula enriched" if enriched else "⚠️ Mobula not indexed yet"
