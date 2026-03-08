@@ -1,245 +1,154 @@
 """
-Mobula Pulse V2 WebSocket client.
-Streams real-time pumpfun token data including:
-  - new      -> new_pair     (not bonded yet)
-  - bonding  -> soon_migrate (final stretch, about to graduate)
-  - bonded   -> migrated     (graduated to Raydium)
+Mobula REST client (free plan).
 
-TokenDataSchema fields we use:
-  address, symbol, name, logo, creatorAddress
-  latest_price, market_cap, liquidity
-  price_change_1h/4h/24h
-  volume_1h/24h, organic_volume_1h
-  trades_1h/24h, organic_trades_1h
-  holdersCount, top10HoldingsPercentage
-  devHoldingsPercentage, insidersHoldingsPercentage
-  bundlersHoldingsPercentage, snipersHoldingsPercentage
-  insidersCount, bundlersCount, snipersCount
-  freshTradersCount, proTradersCount, smartTradersCount
-  proTradersBuys, smartTradersBuys
-  created_at, website, twitter
+Endpoint: GET https://production-api.mobula.io/api/1/market/data
+  ?asset=<mint>&blockchain=solana
+
+Free plan response fields confirmed:
+  price               float  USD price
+  market_cap          float  USD market cap
+  liquidity           float  USD liquidity
+  volume              float  24h on-chain volume USD
+  off_chain_volume    float  24h off-chain volume USD
+  volume_change_24h   float  % change in 24h volume
+  price_change_1h     float  % price change 1h
+  price_change_24h    float  % price change 24h
+  price_change_7d     float  % price change 7d
+
+NOTE: insider %, sniper %, holder counts, organic vol are Pulse V2 WS only
+(Growth plan). We get those from RugCheck instead.
+
+We compute:
+  organic_ratio  = on-chain vol / (on-chain + off-chain)  — proxy for bot activity
+  vol_accel      = bool, True if vol_change_24h > 50%
 """
 
 import asyncio
-import json
 import logging
 import os
 import time
-from typing import Callable
+from typing import Optional
 
-import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
+import aiohttp
 
 logger = logging.getLogger("mobula")
 
-MOBULA_WS  = "wss://pulse-v2-api.mobula.io"
-MOBULA_KEY = os.getenv("MOBULA_API_KEY", "756f2b77-7ec7-4e43-a944-98a4a70e4e4b")
-
-VIEW_CATEGORY = {
-    "bonding": "soon_migrate",
-    "bonded":  "migrated",
-    "new":     "new_pair",
-}
+MOBULA_BASE = "https://production-api.mobula.io/api/1"
+MOBULA_KEY  = os.getenv("MOBULA_API_KEY", "756f2b77-7ec7-4e43-a944-98a4a70e4e4b")
+TIMEOUT     = aiohttp.ClientTimeout(total=15)
+CACHE_TTL   = 30  # seconds
 
 
 class MobulaClient:
     def __init__(self):
-        self._ws = None
-        self._running = False
-        self._reconnect_delay = 5
-        self.on_token: Callable | None = None
-        self._last_seen: dict[str, float] = {}
-        self._DEDUP_WINDOW = 20  # seconds
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._cache: dict[str, tuple[dict, float]] = {}
 
-    async def start_stream(self):
-        self._running = True
-        while self._running:
-            try:
-                await self._connect()
-            except (ConnectionClosed, WebSocketException) as e:
-                logger.warning(f"Mobula WS disconnected: {e}. Reconnecting in {self._reconnect_delay}s...")
-            except Exception as e:
-                logger.error(f"Mobula WS error: {e}. Reconnecting in {self._reconnect_delay}s...")
-            if self._running:
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 1.5, 60)
+    async def _sess(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={
+                    "Authorization": MOBULA_KEY,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=TIMEOUT,
+            )
+        return self._session
 
-    async def _connect(self):
-        logger.info("Connecting to Mobula Pulse V2 (wss://pulse-v2-api.mobula.io)...")
-        async with websockets.connect(
-            MOBULA_WS,
-            ping_interval=30,
-            ping_timeout=15,
-            close_timeout=5,
-        ) as ws:
-            self._ws = ws
-            self._reconnect_delay = 5
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-            await ws.send(json.dumps({
-                "type": "pulse-v2",
-                "authorization": MOBULA_KEY,
-                "payload": {
-                    "model": "default",
-                    "assetMode": True,
-                    "chainId": ["solana:solana"],
-                    "poolTypes": ["pumpfun"],
-                    "compressed": False,
-                }
-            }))
-            logger.info("Mobula Pulse V2 ✓  Streaming new / bonding / bonded pumpfun tokens...")
+    async def enrich_token(self, mint: str) -> dict:
+        """Fetch Mobula market data for a mint. Returns {} on failure."""
+        if not mint:
+            return {}
 
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    await self._handle_message(json.loads(raw))
-                except Exception as e:
-                    logger.error(f"Mobula message error: {e}")
+        cached = self._cache.get(mint)
+        if cached and time.time() - cached[1] < CACHE_TTL:
+            return cached[0]
 
-    async def _handle_message(self, msg: dict):
-        # Mobula sends: {"view": "bonding", "data": [...]}
-        view_name = msg.get("view") or msg.get("name") or ""
-        data = msg.get("data") or msg.get("tokens") or []
+        result = await self._fetch(mint)
+        self._cache[mint] = (result, time.time())
 
-        # Handle nested payload format
-        if not view_name and "payload" in msg:
-            inner = msg["payload"]
-            view_name = inner.get("view") or inner.get("name") or ""
-            data = inner.get("data") or inner.get("tokens") or []
+        if len(self._cache) > 5000:
+            now = time.time()
+            self._cache = {k: v for k, v in self._cache.items()
+                           if now - v[1] < CACHE_TTL * 20}
+        return result
 
-        if not view_name or not isinstance(data, list):
-            return
+    async def _fetch(self, mint: str) -> dict:
+        sess = await self._sess()
+        try:
+            async with sess.get(
+                f"{MOBULA_BASE}/market/data",
+                params={"asset": mint, "blockchain": "solana"},
+            ) as resp:
+                if resp.status == 200:
+                    body = await resp.json(content_type=None)
+                    raw  = body.get("data") or {}
+                    if not raw:
+                        logger.debug(f"Mobula empty data for {mint[:8]}")
+                        return {}
+                    result = self._normalise(raw)
+                    logger.debug(
+                        f"Mobula {mint[:8]}: mc=${result.get('market_cap_usd',0):,.0f} "
+                        f"liq=${result.get('liquidity_usd',0):,.0f} "
+                        f"1h={result.get('price_change_1h',0):+.1f}% "
+                        f"vol24h=${result.get('volume_24h_usd',0):,.0f} "
+                        f"organic={result.get('mobula_organic_ratio',0):.0%}"
+                    )
+                    return result
+                elif resp.status == 404:
+                    logger.debug(f"Mobula: {mint[:8]} not indexed yet")
+                elif resp.status == 429:
+                    logger.warning(f"Mobula rate limited")
+                    await asyncio.sleep(2)
+                else:
+                    logger.debug(f"Mobula HTTP {resp.status} for {mint[:8]}")
+        except asyncio.TimeoutError:
+            logger.debug(f"Mobula timeout {mint[:8]}")
+        except Exception as e:
+            logger.debug(f"Mobula error {mint[:8]}: {e}")
+        return {}
 
-        category = VIEW_CATEGORY.get(view_name)
-        if not category:
-            return
-
-        now = time.time()
-        for raw_token in data:
-            mint = raw_token.get("address") or raw_token.get("mint") or ""
-            if not mint:
-                continue
-            if now - self._last_seen.get(mint, 0) < self._DEDUP_WINDOW:
-                continue
-            self._last_seen[mint] = now
-
-            token = self._normalise(raw_token, category)
-            if self.on_token:
-                try:
-                    await self.on_token(token, category)
-                except Exception as e:
-                    logger.error(f"on_token error: {e}")
-
-        # Trim dedup cache
-        if len(self._last_seen) > 10000:
-            cutoff = now - self._DEDUP_WINDOW * 10
-            self._last_seen = {k: v for k, v in self._last_seen.items() if v > cutoff}
-
-    def _normalise(self, r: dict, category: str) -> dict:
-        now = time.time()
-
-        def flt(k, d=0.0):
-            v = r.get(k)
+    def _normalise(self, raw: dict) -> dict:
+        def f(k, d=0.0):
+            v = raw.get(k)
             try: return float(v) if v is not None else d
             except: return d
 
-        def num(k, d=0):
-            v = r.get(k)
-            try: return int(v) if v is not None else d
-            except: return d
+        price       = f("price")
+        mc          = f("market_cap")
+        liquidity   = f("liquidity")
+        vol_24h     = f("volume")            # on-chain 24h
+        off_chain   = f("off_chain_volume")  # off-chain 24h
+        vol_change  = f("volume_change_24h") # % vol change vs prior day
+        pc_1h       = f("price_change_1h")
+        pc_24h      = f("price_change_24h")
+        pc_7d       = f("price_change_7d")
+        liq_change  = f("liquidity_change_24h")
 
-        def txt(k, d=""):
-            v = r.get(k)
-            return str(v).strip() if v else d
+        total_vol = vol_24h + off_chain
+        organic_ratio = vol_24h / total_vol if total_vol > 0 else 1.0
 
-        created_raw = r.get("created_at") or r.get("createdAt") or 0
-        created_at  = (created_raw / 1000) if created_raw > 1e10 else (float(created_raw) if created_raw else now)
-        age_s       = now - created_at
+        result = {
+            # Direct overrides for token fields (only if non-zero)
+            "market_cap_usd":    mc       if mc > 0       else None,
+            "price_usd":         price    if price > 0    else None,
+            "liquidity_usd":     liquidity if liquidity > 0 else None,
+            "volume_24h_usd":    vol_24h  if vol_24h > 0  else None,
+            "price_change_1h":   pc_1h    if pc_1h != 0   else None,
+            "price_change_24h":  pc_24h   if pc_24h != 0  else None,
 
-        liquidity   = flt("liquidity")
-        sol_fees_est = liquidity / 150 if liquidity > 0 else 0.0
-
-        return {
-            # Identity
-            "mint":        txt("address") or txt("mint"),
-            "name":        txt("name", "Unknown"),
-            "symbol":      txt("symbol", "???"),
-            "dev_wallet":  txt("creatorAddress") or txt("creator"),
-            "image_uri":   txt("logo") or txt("image"),
-            "twitter":     txt("twitter") or txt("twitterUrl"),
-            "website":     txt("website") or txt("websiteUrl"),
-            "description": txt("description"),
-            "launchpad":   "pumpfun",
-
-            # Time
-            "created_at":          created_at,
-            "age_seconds":         age_s,
-            "receipt_age_minutes": age_s / 60,
-            "_receipt_time":       now,
-
-            # Market
-            "market_cap_usd": flt("market_cap"),
-            "market_cap_sol": 0.0,
-            "price_usd":      flt("latest_price"),
-            "liquidity_usd":  liquidity,
-
-            # Price changes
-            "price_change_5m":  flt("price_change_5m"),
-            "price_change_1h":  flt("price_change_1h"),
-            "price_change_4h":  flt("price_change_4h"),
-            "price_change_24h": flt("price_change_24h"),
-
-            # Volume
-            "volume_5m_usd":      flt("volume_5m"),
-            "volume_1h_usd":      flt("volume_1h"),
-            "volume_24h_usd":     flt("volume_24h"),
-            "organic_volume_1h":  flt("organic_volume_1h"),
-            "organic_trades_1h":  flt("organic_trades_1h"),
-
-            # Trades
-            "tx_buys_5m":  num("buy_trades_5m") or num("buyTrades5m"),
-            "tx_sells_5m": num("sell_trades_5m") or num("sellTrades5m"),
-            "trades_1h":   num("trades_1h"),
-            "trades_24h":  num("trades_24h"),
-
-            # ── Holder health (the data we never had before) ──
-            "holders_count":     num("holdersCount"),
-            "top10_holders_pct": flt("top10HoldingsPercentage"),
-            "dev_holding_pct":   flt("devHoldingsPercentage"),
-            "insider_pct":       flt("insidersHoldingsPercentage"),
-            "bundles_pct":       flt("bundlersHoldingsPercentage"),
-            "snipers_pct":       flt("snipersHoldingsPercentage"),
-
-            # Trader counts
-            "insiders_count":    num("insidersCount"),
-            "bundlers_count":    num("bundlersCount"),
-            "snipers_count":     num("snipersCount"),
-            "fresh_traders":     num("freshTradersCount"),
-            "pro_holders_count": num("proTradersCount"),
-            "smart_traders":     num("smartTradersCount"),
-
-            # Smart money activity
-            "pro_traders_buys":   num("proTradersBuys"),
-            "smart_traders_buys": num("smartTradersBuys"),
-
-            # SOL fees estimate from liquidity
-            "total_sol_fees": flt("totalSolFees") or flt("solFees") or sol_fees_est,
-
-            # Status
-            "is_migrated":   category == "migrated",
-            "is_soon":       category == "soon_migrate",
-            "is_dex_listed": category == "migrated",
-
-            # Filled by rugcheck
-            "rug_status":    "Unknown",
-            "rug_score":     0,
-            "rug_mintable":  False,
-            "rug_freezable": False,
-            "rug_risks":     [],
-
-            # Filled by scorer
-            "runner_score":    0,
-            "runner_tier":     "",
-            "runner_reasons":  [],
-            "filter_category": category,
+            # Mobula-specific enrichment fields used in scoring
+            "mobula_vol_change_24h":  vol_change,
+            "mobula_liq_change_24h":  liq_change,
+            "mobula_organic_ratio":   round(organic_ratio, 3),
+            "mobula_vol_accel":       vol_change > 50,   # vol spiking vs yesterday
+            "mobula_price_change_7d": pc_7d,
+            "mobula_enriched":        True,
         }
+        # Strip Nones so we don't overwrite good data with None
+        return {k: v for k, v in result.items() if v is not None}

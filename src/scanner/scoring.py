@@ -1,15 +1,25 @@
 """
-Runner scoring — built around EARLY predictive signals, not lagging confirmation.
+Runner scoring — early predictive signals only.
 
-The goal is to catch a coin BEFORE it pumps, not after.
+Data sources per field:
+  PumpPortal  → tx_buys_5m, tx_sells_5m, volume_5m_usd, market_cap_usd (initial),
+                total_sol_fees (bonding curve fill), is_migrated, socials
+  Mobula REST → market_cap_usd (better), liquidity_usd, volume_24h_usd,
+                price_change_1h, price_change_24h,
+                mobula_vol_change_24h (vol accel vs yesterday),
+                mobula_organic_ratio (on-chain / total — bot filter proxy),
+                mobula_vol_accel (True if vol_change_24h > 50%)
+  RugCheck    → top10_holders_pct, dev_holding_pct, insider_pct,
+                mintable, freezable, lp_locked, status, score
 
-Signals are grouped into three categories:
-  1. IGNITION  — the spark: something is just starting to move
-  2. STRUCTURE — the setup: token is actually safe to run
-  3. FUEL      — the capacity: enough capital and interest to sustain a run
+Scoring is grouped:
+  IGNITION  — early momentum signals (happening right now)
+  STRUCTURE — token is clean enough to actually run
+  FUEL      — capacity to sustain a move
 
-Each signal is weighted by how EARLY and PREDICTIVE it is, not how big it is.
+Max theoretical score: ~100 (capped at 100, min 0)
 """
+
 import logging
 import os
 
@@ -33,206 +43,201 @@ class RunnerScorer:
         pts = 0
         reasons: list[str] = []
 
-        # ── Raw data ──────────────────────────────────────────────────────────
-        mc           = token.get("market_cap_usd", 0) or 0
-        liquidity    = token.get("liquidity_usd", 0) or 0
-        vol_5m       = token.get("volume_5m_usd", 0) or 0
-        vol_1h       = token.get("volume_1h_usd", 0) or 0
-        vol_24h      = token.get("volume_24h_usd", 0) or 0
-        organic_vol  = token.get("organic_volume_1h", 0) or 0
-        organic_txns = token.get("organic_trades_1h", 0) or 0
-        pc_5m        = token.get("price_change_5m", 0) or 0
-        pc_1h        = token.get("price_change_1h", 0) or 0
-        pc_4h        = token.get("price_change_4h", 0) or 0
-        buys         = token.get("tx_buys_5m", 0) or 0
-        sells        = token.get("tx_sells_5m", 0) or 0
-        trades_1h    = token.get("trades_1h", 0) or 0
-        top10        = token.get("top10_holders_pct", 0) or 0
-        dev_pct      = token.get("dev_holding_pct", 0) or 0
-        insider_pct  = token.get("insider_pct", 0) or 0
-        snipers      = token.get("snipers_pct", 0) or 0
-        bundles      = token.get("bundles_pct", 0) or 0
-        holders      = token.get("holders_count", 0) or 0
-        pro_holders  = token.get("pro_holders_count", 0) or 0
-        smart_buys   = token.get("smart_traders_buys", 0) or 0
-        pro_buys     = token.get("pro_traders_buys", 0) or 0
-        fresh_traders= token.get("fresh_traders", 0) or 0
-        sol_fees     = token.get("total_sol_fees", 0) or 0
-        lp_locked    = token.get("lp_locked", False)
-        migrated     = token.get("is_migrated", False)
-        is_soon      = token.get("is_soon", False)
-        category     = token.get("filter_category", "new_pair")
-        rug          = token.get("rug_status", "Unknown")
-        twitter      = bool(token.get("twitter"))
-        website      = bool(token.get("website"))
-        age_min      = token.get("receipt_age_minutes", 0) or 0
+        # ── Pull every field we have ───────────────────────────────────────────
+        mc          = token.get("market_cap_usd", 0) or 0
+        liquidity   = token.get("liquidity_usd", 0) or 0
+        vol_5m      = token.get("volume_5m_usd", 0) or 0
+        vol_24h     = token.get("volume_24h_usd", 0) or 0
+        pc_1h       = token.get("price_change_1h", 0) or 0
+        pc_24h      = token.get("price_change_24h", 0) or 0
+        buys        = token.get("tx_buys_5m", 0) or 0
+        sells       = token.get("tx_sells_5m", 0) or 0
+        sol_fees    = token.get("total_sol_fees", 0) or 0
 
-        # ── Derived signals ───────────────────────────────────────────────────
-        total_tx     = buys + sells
-        buy_ratio    = buys / total_tx if total_tx > 0 else 0
+        # Holder data from RugCheck
+        top10       = token.get("top10_holders_pct", 0) or 0
+        dev_pct     = token.get("dev_holding_pct", 0) or 0
+        insider_pct = token.get("insider_pct", 0) or 0
 
-        # Volume acceleration: 5m vs 1h hourly rate
-        # If 5m vol is outpacing 1h average, volume is ACCELERATING right now
-        vol_1h_rate  = vol_1h / 60 if vol_1h > 0 else 0   # per-minute average
-        vol_accel    = (vol_5m / 5) / vol_1h_rate if vol_1h_rate > 0 else 0
+        # Mobula enrichment
+        vol_change     = token.get("mobula_vol_change_24h", 0) or 0  # % vs yesterday
+        organic_ratio  = token.get("mobula_organic_ratio", 1.0)       # 0-1, higher = more organic
+        vol_accel_flag = token.get("mobula_vol_accel", False)          # True if vol > 50% above yesterday
+        liq_change     = token.get("mobula_liq_change_24h", 0) or 0
 
-        # Organic ratio: real vs total volume (bot filter)
-        organic_ratio = organic_vol / vol_1h if vol_1h > 0 else 0
+        # Status
+        rug         = token.get("rug_status", "Unknown")
+        rug_score   = token.get("rug_score", 0) or 0
+        lp_locked   = token.get("lp_locked", False)
+        mintable    = token.get("rug_mintable", False)
+        freezable   = token.get("rug_freezable", False)
+        migrated    = token.get("is_migrated", False)
+        is_soon     = token.get("is_soon", False)
+        category    = token.get("filter_category", "new_pair")
+        twitter     = bool(token.get("twitter"))
+        website     = bool(token.get("website"))
+        enriched    = token.get("mobula_enriched", False)
 
-        # Liquidity/MC ratio: how much of the cap is actually liquid
-        liq_mc_ratio  = liquidity / mc if mc > 0 else 0
-
-        # Holder velocity: holders relative to age (fast accumulation = early signal)
-        holder_velocity = holders / max(age_min, 1)
+        # Derived
+        total_tx      = buys + sells
+        buy_ratio     = buys / total_tx if total_tx > 0 else 0.0
+        liq_mc_ratio  = liquidity / mc if mc > 0 else 0.0
 
         # ═══════════════════════════════════════════════════════════════════════
-        # IGNITION SIGNALS (max ~45 pts) — the spark that precedes a run
+        # IGNITION SIGNALS — is something starting to move RIGHT NOW?
         # ═══════════════════════════════════════════════════════════════════════
 
-        # ── Volume acceleration (STRONGEST early signal) ──────────────────────
-        # 5m pace is outrunning 1h average = volume is spiking RIGHT NOW
-        if vol_accel >= 5.0:
-            pts += 18; reasons.append(f"Vol accel {vol_accel:.1f}x 🚀")
-        elif vol_accel >= 3.0:
-            pts += 12; reasons.append(f"Vol accel {vol_accel:.1f}x")
-        elif vol_accel >= 2.0:
-            pts += 7;  reasons.append(f"Vol accel {vol_accel:.1f}x")
-        elif vol_accel >= 1.5:
+        # ── Volume acceleration vs yesterday (Mobula) ─────────────────────────
+        # vol_change is % change: +200 means today's vol is 3x yesterday's
+        # This is the clearest early runner signal — volume waking up
+        if vol_accel_flag and vol_change >= 200:
+            pts += 20; reasons.append(f"Vol +{vol_change:.0f}% vs yesterday 🚀")
+        elif vol_accel_flag and vol_change >= 100:
+            pts += 14; reasons.append(f"Vol +{vol_change:.0f}% vs yesterday")
+        elif vol_accel_flag:
+            pts += 8;  reasons.append(f"Vol accelerating +{vol_change:.0f}%")
+        elif vol_change > 20:
             pts += 3
 
-        # ── Smart / pro money entering (very early signal) ────────────────────
-        # Smart wallets buy BEFORE the crowd — this is the most predictive signal
-        if smart_buys >= 3:
-            pts += 18; reasons.append(f"{smart_buys} smart wallet buys 🧠")
-        elif smart_buys >= 1:
-            pts += 10; reasons.append(f"{smart_buys} smart wallet buy")
-
-        if pro_buys >= 5:
-            pts += 10; reasons.append(f"{pro_buys} pro buys")
-        elif pro_buys >= 2:
+        # ── 5m buy pressure (PumpPortal live data) ────────────────────────────
+        # buy_ratio + count together = real demand, not a single bot
+        if buy_ratio >= 0.85 and total_tx >= 15:
+            pts += 15; reasons.append(f"Buy pressure {buy_ratio*100:.0f}% ({total_tx} txns)")
+        elif buy_ratio >= 0.80 and total_tx >= 8:
+            pts += 10; reasons.append(f"Buy pressure {buy_ratio*100:.0f}%")
+        elif buy_ratio >= 0.70 and total_tx >= 5:
             pts += 5
-
-        # ── Buy pressure (sustained demand signal) ────────────────────────────
-        if buy_ratio >= 0.85 and total_tx >= 10:
-            pts += 12; reasons.append(f"Buy pressure {buy_ratio*100:.0f}% ({total_tx} txns)")
-        elif buy_ratio >= 0.75 and total_tx >= 5:
-            pts += 8;  reasons.append(f"Buy pressure {buy_ratio*100:.0f}%")
-        elif buy_ratio >= 0.65 and total_tx >= 5:
-            pts += 4
-
-        # ── 5m price spike (momentum just starting) ───────────────────────────
-        # Small, fresh spike in 5m is more predictive than a big 1h move
-        if pc_5m >= 30 and pc_1h < 80:   # Big 5m move but 1h not already pumped
-            pts += 10; reasons.append(f"+{pc_5m:.0f}% 5m (early)")
-        elif pc_5m >= 15:
-            pts += 6;  reasons.append(f"+{pc_5m:.0f}% 5m")
-        elif pc_5m >= 5:
+        elif buy_ratio >= 0.60 and total_tx >= 3:
             pts += 2
 
-        # ── Organic volume spike (real humans, not bots) ──────────────────────
-        if organic_ratio >= 0.85 and vol_1h >= 2000:
-            pts += 10; reasons.append(f"Organic vol {organic_ratio*100:.0f}%")
-        elif organic_ratio >= 0.65 and vol_1h >= 1000:
-            pts += 5
-
-        # ── Fresh trader influx (new buyers entering = early adoption) ────────
-        if fresh_traders >= 20:
-            pts += 8; reasons.append(f"{fresh_traders} fresh traders")
-        elif fresh_traders >= 8:
+        # ── Price momentum (Mobula 1h) ────────────────────────────────────────
+        # 1h change: small move early is more predictive than a huge move late
+        if 10 <= pc_1h < 50:
+            pts += 10; reasons.append(f"+{pc_1h:.0f}% 1h (early move)")
+        elif pc_1h >= 50:
+            pts += 6;  reasons.append(f"+{pc_1h:.0f}% 1h")  # may already be late
+        elif 3 <= pc_1h < 10:
             pts += 4
-        elif fresh_traders >= 3:
-            pts += 2
 
-        # ── Rapid holder accumulation (relative to token age) ────────────────
-        if holder_velocity >= 10:   # 10+ new holders per minute
-            pts += 8; reasons.append(f"Holder velocity {holder_velocity:.0f}/min")
-        elif holder_velocity >= 4:
+        # ── Organic volume ratio (Mobula) ─────────────────────────────────────
+        # High on-chain vs off-chain = real DEX activity, not wash trading
+        if enriched:
+            if organic_ratio >= 0.90:
+                pts += 10; reasons.append(f"Organic vol {organic_ratio*100:.0f}%")
+            elif organic_ratio >= 0.70:
+                pts += 6
+            elif organic_ratio >= 0.50:
+                pts += 2
+            elif organic_ratio < 0.20:
+                pts -= 5  # mostly off-chain / bot volume
+
+        # ── Liquidity growing (Mobula liq change) ────────────────────────────
+        # LP increasing while price rises = organic buyers adding liquidity
+        if liq_change > 50:
+            pts += 8; reasons.append(f"Liq +{liq_change:.0f}% 24h")
+        elif liq_change > 20:
             pts += 4
-        elif holder_velocity >= 1:
-            pts += 1
+        elif liq_change < -30:
+            pts -= 6  # LP being pulled while price up = red flag
+
+        # ── 5m volume signal (PumpPortal) ────────────────────────────────────
+        # Volume relative to market cap (turnover) — high turnover at low MC = hot
+        if mc > 0 and vol_5m > 0:
+            turnover_5m = vol_5m / mc
+            if turnover_5m >= 0.10:
+                pts += 8; reasons.append(f"5m turnover {turnover_5m*100:.0f}%")
+            elif turnover_5m >= 0.05:
+                pts += 4
+            elif turnover_5m >= 0.02:
+                pts += 2
 
         # ═══════════════════════════════════════════════════════════════════════
-        # STRUCTURE SIGNALS (max ~30 pts) — token is safe to run
+        # STRUCTURE SIGNALS — is this token actually safe to run?
         # ═══════════════════════════════════════════════════════════════════════
 
-        # ── Low concentration = room to run without easy dump ─────────────────
+        # ── Top 10 holder concentration (RugCheck) ────────────────────────────
+        # Lower = harder for whales to dump it on you
         if top10 > 0:
             if top10 <= 15:
-                pts += 10; reasons.append(f"Top10 only {top10:.0f}% 💎")
+                pts += 12; reasons.append(f"Top10 {top10:.0f}% — well spread 💎")
             elif top10 <= 25:
-                pts += 6
-            elif top10 <= 35:
-                pts += 2
-            elif top10 >= 70:
-                pts -= 10  # concentrated = dump risk
+                pts += 8;  reasons.append(f"Top10 {top10:.0f}%")
+            elif top10 <= 40:
+                pts += 3
+            elif top10 > 70:
+                pts -= 10; reasons.append(f"Top10 {top10:.0f}% — concentrated ⚠️")
 
-        # ── Low dev holding (dev can't dump easily) ───────────────────────────
+        # ── Dev holding (RugCheck) ────────────────────────────────────────────
         if dev_pct > 0:
             if dev_pct <= 3:
-                pts += 8; reasons.append(f"Dev only {dev_pct:.1f}% ✓")
+                pts += 8; reasons.append(f"Dev {dev_pct:.1f}% ✓")
             elif dev_pct <= 8:
                 pts += 4
-            elif dev_pct > 15:
-                pts -= 8; reasons.append(f"Dev holds {dev_pct:.0f}% ⚠️")
+            elif dev_pct <= 15:
+                pts += 1
+            else:
+                pts -= 8; reasons.append(f"Dev {dev_pct:.0f}% ⚠️")
 
-        # ── Low snipers / insiders (clean launch) ─────────────────────────────
-        if snipers > 0 and snipers <= 5:
-            pts += 5
-        elif snipers > 15:
-            pts -= 5
+        # ── Insider concentration (RugCheck) ──────────────────────────────────
+        if insider_pct > 0:
+            if insider_pct <= 5:
+                pts += 5
+            elif insider_pct <= 15:
+                pts += 2
+            elif insider_pct > 30:
+                pts -= 6; reasons.append(f"Insiders {insider_pct:.0f}% ⚠️")
 
-        if insider_pct > 0 and insider_pct <= 10:
-            pts += 3
-        elif insider_pct > 25:
-            pts -= 5
+        # ── Mintable / Freezable (RugCheck) ───────────────────────────────────
+        if mintable:
+            pts -= 10; reasons.append("Mintable ❌")
+        if freezable:
+            pts -= 8; reasons.append("Freezable ❌")
 
-        if bundles > 0 and bundles > 20:
-            pts -= 4; reasons.append(f"Bundles {bundles:.0f}% ⚠️")
-
-        # ── RugCheck (safety baseline) ────────────────────────────────────────
+        # ── RugCheck score + status ───────────────────────────────────────────
         if rug == "Good":
             pts += 8; reasons.append("RugCheck ✓")
         elif rug == "Warn":
-            pts += 1
+            pts += 2
         elif rug == "Danger":
-            pts -= 25  # Hard penalty
+            pts -= 25  # shouldn't reach here (blocked in scanner) but safety net
 
         if lp_locked:
             pts += 5; reasons.append("LP Locked ✓")
 
-        # ── Socials (legitimacy signal — projects that run have socials) ───────
+        # ── Socials (PumpPortal metadata) ─────────────────────────────────────
+        # Projects that run almost always have socials — it's a legitimacy signal
         if twitter and website:
             pts += 6; reasons.append("Socials ✓")
         elif twitter or website:
-            pts += 2
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # FUEL SIGNALS (max ~25 pts) — enough capacity to sustain a run
-        # ═══════════════════════════════════════════════════════════════════════
-
-        # ── Liquidity/MC ratio (how deep the book is relative to cap) ─────────
-        # Higher ratio = harder to manipulate, more sustainable moves
-        if liq_mc_ratio >= 0.15:
-            pts += 10; reasons.append(f"Liq/MC {liq_mc_ratio*100:.0f}%")
-        elif liq_mc_ratio >= 0.08:
-            pts += 6
-        elif liq_mc_ratio >= 0.03:
-            pts += 2
-
-        # ── Pro holder count (smart money conviction) ─────────────────────────
-        if pro_holders >= 20:
-            pts += 6; reasons.append(f"{pro_holders} pro holders")
-        elif pro_holders >= 5:
             pts += 3
 
-        # ── Migration stage bonus ─────────────────────────────────────────────
-        # Migrated/soon coins survived the bonding curve = proven demand
-        if migrated:
-            pts += 8; reasons.append("Migrated ✓")
-        elif is_soon or category == "soon_migrate":
-            pts += 5; reasons.append("Soon migrate ⚡")
+        # ═══════════════════════════════════════════════════════════════════════
+        # FUEL SIGNALS — does this token have enough capacity to actually run?
+        # ═══════════════════════════════════════════════════════════════════════
 
-        # ── Bonding curve fill (how much SOL has been committed) ──────────────
+        # ── Liquidity / MC ratio (Mobula) ─────────────────────────────────────
+        # Higher = deeper book = slippage resistance = sustainable move
+        if liquidity > 0 and mc > 0:
+            if liq_mc_ratio >= 0.20:
+                pts += 8; reasons.append(f"Liq/MC {liq_mc_ratio*100:.0f}% — deep")
+            elif liq_mc_ratio >= 0.10:
+                pts += 5; reasons.append(f"Liq/MC {liq_mc_ratio*100:.0f}%")
+            elif liq_mc_ratio >= 0.05:
+                pts += 2
+            elif liq_mc_ratio < 0.02:
+                pts -= 3  # very thin liquidity = easy to move but easy to dump
+
+        # ── MC sweet spot ─────────────────────────────────────────────────────
+        # Best runners: big enough to be noticed, small enough to 10x
+        if 5_000 <= mc <= 30_000:
+            pts += 6; reasons.append(f"Sweet spot ${mc/1000:.0f}K MC")
+        elif 30_000 < mc <= 100_000:
+            pts += 3
+        elif mc > 500_000:
+            pts -= 5  # may already have pumped
+
+        # ── Bonding curve progress (PumpPortal) ───────────────────────────────
+        # More SOL committed = more real buyer conviction
         if sol_fees >= 60:
             pts += 6; reasons.append(f"{sol_fees:.0f} SOL bonded")
         elif sol_fees >= 20:
@@ -240,15 +245,12 @@ class RunnerScorer:
         elif sol_fees >= 5:
             pts += 1
 
-        # ── Market cap sweet spot: not already pumped, not too small ──────────
-        # Best runners start between $5K-$50K MC — big enough to have legs
-        if 5_000 <= mc <= 50_000:
-            pts += 5; reasons.append(f"MC sweet spot ${mc/1000:.0f}K")
-        elif mc <= 100_000:
-            pts += 2
-        # Penalise if already at huge MC (late)
-        elif mc >= 500_000:
-            pts -= 5; reasons.append(f"MC ${mc/1000:.0f}K (late?)")
+        # ── Migration status ──────────────────────────────────────────────────
+        # Migrated = survived bonding curve = proven demand
+        if migrated:
+            pts += 8; reasons.append("Migrated ✓")
+        elif is_soon or category == "soon_migrate":
+            pts += 4; reasons.append("Soon to migrate ⚡")
 
         return max(0, min(pts, 100)), reasons
 

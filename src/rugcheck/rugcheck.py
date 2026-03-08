@@ -1,22 +1,34 @@
 """
-RugCheck integration.
-Primary:  GET https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary  (no auth needed)
-Fallback: GET https://api.rugcheck.xyz/v1/tokens/{mint}/report          (full report)
+RugCheck client — full report endpoint.
 
-JWT auth is supported on the paid tier. We attempt unauthenticated first
-(summary endpoint is public), then sign with Solana key if env var is set.
+Auth:
+  Public (no key): GET /v1/tokens/{mint}/report
+    → returns cached report, free, no rate issues
+  Authenticated (JWT): same endpoint but fresher data
+    → set SOLANA_PRIVATE_KEY in .env to enable JWT auth
 
-Fields extracted:
-  score (0-1000, higher = safer)
-  risks: list of risk strings
-  mintable, freezable
-  top_holder_pct, insider_pct, dev_holding_pct
-  lp_locked (bool)
-  status: "Good" | "Warn" | "Danger" | "Unknown"
+Real response fields (from production API):
+  mint, creator, tokenMeta {name, symbol, mutable, updateAuthority}
+  token {supply, decimals}
+  mintAuthority   string|null   — not null = can mint more tokens (BAD)
+  freezeAuthority string|null   — not null = can freeze wallets (BAD)
+  rugged          bool
+  score           int  (0-1000+, HIGHER = MORE RISKY on rugcheck)
+  risks           [{name, description, level, score, value}]
+                    level: "danger"|"warn"|"info"
+  topHolders      [{address, amount, decimals, pct, uiAmount, uiAmountString,
+                    owner, insider}]
+                    pct is 0.0–1.0 (e.g. 0.05 = 5%)
+  markets         [{pubkey, marketType, mintA, mintB, liquidityA, liquidityB,
+                    lpMint, lpLockedPct, lp {lpLockedPct, lpBurnedPct, ...}}]
+  graphInsiderReport  {id, mintAddress, ... holdingPercent, ...} | null
+                    holdingPercent is 0.0–1.0
+  totalMarketLiquidity  float USD
+  lockers         [...]
+  verification    {mint, payer, name, symbol, description, jito, ...} | null
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -27,85 +39,94 @@ import aiohttp
 
 logger = logging.getLogger("rugcheck")
 
-RUGCHECK_BASE    = "https://api.rugcheck.xyz/v1"
-REQUEST_TIMEOUT  = aiohttp.ClientTimeout(total=20)
+RUGCHECK_BASE   = "https://api.rugcheck.xyz/v1"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
 
-# Optional Solana private key for JWT auth (paid tier)
-_SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
-
-# JWT cache
+# JWT cache — valid ~2 days per RugCheck docs
 _jwt_token: str = ""
 _jwt_expiry: float = 0.0
 
 
-def _generate_jwt() -> str:
+async def _get_jwt() -> str:
     """
-    Generate a RugCheck JWT by signing a message with the Solana private key.
-    Only used if SOLANA_PRIVATE_KEY is set in .env.
-    Falls back gracefully if solders/nacl not installed.
+    Generate JWT via POST /auth/login/solana.
+    Requires SOLANA_PRIVATE_KEY in .env (base58 encoded).
+    Message format: {"message":"Sign-in to Rugcheck.xyz","timestamp":<ms>,"publicKey":"<pubkey>"}
+    Signature: ed25519 sign of JSON string, returned as list of ints.
     """
     global _jwt_token, _jwt_expiry
 
-    if not _SOLANA_PRIVATE_KEY:
+    if not SOLANA_PRIVATE_KEY:
         return ""
-
-    # Return cached token if still valid (5 min buffer)
-    if _jwt_token and time.time() < _jwt_expiry - 300:
+    if _jwt_token and time.time() < _jwt_expiry - 3600:
         return _jwt_token
 
     try:
-        from solders.keypair import Keypair  # type: ignore
         import base58
+        from solders.keypair import Keypair  # type: ignore
 
-        raw = base58.b58decode(_SOLANA_PRIVATE_KEY)
-        kp = Keypair.from_bytes(raw)
+        kp = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+        pubkey = str(kp.pubkey())
 
-        # RugCheck expects: sign the message "rugcheck:{timestamp}"
-        ts = int(time.time())
-        message = f"rugcheck:{ts}".encode()
-        sig = kp.sign_message(message)
-        sig_b64 = base64.b64encode(bytes(sig)).decode()
-        pub_b58 = str(kp.pubkey())
-
-        # Build JWT payload (RugCheck uses a simple base64 scheme)
-        payload = {
-            "publicKey": pub_b58,
-            "signature": sig_b64,
-            "timestamp": ts,
+        msg_data = {
+            "message": "Sign-in to Rugcheck.xyz",
+            "timestamp": int(time.time() * 1000),
+            "publicKey": pubkey,
         }
-        payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
-        _jwt_token = payload_b64
-        _jwt_expiry = time.time() + 3600  # 1 hour
-        logger.info("RugCheck JWT generated successfully")
-        return _jwt_token
+        # Must be compact JSON (no spaces) to match what they verify
+        msg_json = json.dumps(msg_data, separators=(",", ":"))
+        msg_bytes = msg_json.encode("utf-8")
 
+        sig = kp.sign_message(msg_bytes)
+        sig_b58 = str(sig)
+        sig_data = list(base58.b58decode(sig_b58))
+
+        payload = {
+            "signature": {"data": sig_data, "type": "ed25519"},
+            "wallet": pubkey,
+            "message": msg_data,
+        }
+
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                "https://api.rugcheck.xyz/auth/login/solana",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    token = data.get("token") or data.get("jwt") or data.get("access_token","")
+                    if token:
+                        _jwt_token = token
+                        _jwt_expiry = time.time() + 172800  # 2 days
+                        logger.info("RugCheck JWT obtained ✓")
+                        return _jwt_token
+                    logger.warning(f"RugCheck login returned no token: {data}")
+                else:
+                    txt = await resp.text()
+                    logger.warning(f"RugCheck login failed HTTP {resp.status}: {txt[:200]}")
     except ImportError:
-        logger.debug("solders/base58 not installed — using unauthenticated RugCheck")
-        return ""
+        logger.debug("solders/base58 not installed — RugCheck running unauthenticated")
     except Exception as e:
-        logger.warning(f"JWT generation failed: {e}")
-        return ""
+        logger.warning(f"RugCheck JWT error: {e}")
+    return ""
 
 
 class RugChecker:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._cache: dict[str, tuple[dict, float]] = {}  # mint -> (report, timestamp)
-        self._CACHE_TTL = 300  # 5 minutes
+        self._cache: dict[str, tuple[dict, float]] = {}
+        self._CACHE_TTL = 300  # 5 min
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            headers = {
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            }
-            jwt = _generate_jwt()
+            headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+            jwt = await _get_jwt()
             if jwt:
                 headers["Authorization"] = f"Bearer {jwt}"
-            self._session = aiohttp.ClientSession(
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-            )
+            self._session = aiohttp.ClientSession(headers=headers, timeout=REQUEST_TIMEOUT)
         return self._session
 
     async def close(self):
@@ -116,147 +137,156 @@ class RugChecker:
         if not mint:
             return self._unknown()
 
-        # Check cache
         cached = self._cache.get(mint)
-        if cached:
-            report, ts = cached
-            if time.time() - ts < self._CACHE_TTL:
-                return report
+        if cached and time.time() - cached[1] < self._CACHE_TTL:
+            return cached[0]
 
-        result = await self._fetch_report(mint)
+        result = await self._fetch(mint)
         self._cache[mint] = (result, time.time())
 
-        # Trim cache
-        if len(self._cache) > 2000:
+        if len(self._cache) > 3000:
             now = time.time()
-            self._cache = {k: v for k, v in self._cache.items()
-                           if now - v[1] < self._CACHE_TTL}
+            self._cache = {k: v for k, v in self._cache.items() if now - v[1] < self._CACHE_TTL}
         return result
 
-    async def _fetch_report(self, mint: str) -> dict:
-        """Try summary endpoint first, then full report as fallback."""
-        session = await self._get_session()
+    async def _fetch(self, mint: str) -> dict:
+        sess = await self._get_session()
 
-        # Try summary (public, fast)
-        try:
-            url = f"{RUGCHECK_BASE}/tokens/{mint}/report/summary"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return self._parse_summary(data, mint)
-                elif resp.status == 429:
-                    logger.warning(f"RugCheck rate limited for {mint[:8]}")
-                    await asyncio.sleep(2)
-                else:
-                    logger.debug(f"RugCheck summary HTTP {resp.status} for {mint[:8]}")
-        except asyncio.TimeoutError:
-            logger.debug(f"RugCheck summary timeout for {mint[:8]}")
-        except Exception as e:
-            logger.debug(f"RugCheck summary error: {e}")
-
-        # Try full report
-        try:
-            url = f"{RUGCHECK_BASE}/tokens/{mint}/report"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return self._parse_full(data, mint)
-                logger.debug(f"RugCheck full report HTTP {resp.status} for {mint[:8]}")
-        except Exception as e:
-            logger.debug(f"RugCheck full report error: {e}")
+        for endpoint in [
+            f"{RUGCHECK_BASE}/tokens/{mint}/report",
+            f"{RUGCHECK_BASE}/tokens/{mint}/report/summary",
+        ]:
+            try:
+                async with sess.get(endpoint) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        result = self._parse(data)
+                        logger.info(
+                            f"RugCheck {mint[:8]}: {result['status']} "
+                            f"score={result['score']} "
+                            f"top10={result['top10_holders_pct']:.1f}% "
+                            f"dev={result['dev_holding_pct']:.1f}% "
+                            f"insider={result['insider_pct']:.1f}% "
+                            f"mint={result['mintable']} freeze={result['freezable']} "
+                            f"lp_lock={result['lp_locked']}"
+                        )
+                        return result
+                    elif resp.status == 429:
+                        logger.warning("RugCheck rate limited — sleeping 3s")
+                        await asyncio.sleep(3)
+                        break
+                    else:
+                        logger.debug(f"RugCheck HTTP {resp.status} for {mint[:8]} via {endpoint.split('/')[-1]}")
+            except asyncio.TimeoutError:
+                logger.debug(f"RugCheck timeout for {mint[:8]}")
+            except Exception as e:
+                logger.debug(f"RugCheck error for {mint[:8]}: {e}")
 
         return self._unknown()
 
-    def _parse_summary(self, data: dict, mint: str) -> dict:
-        """Parse /report/summary response."""
-        risks_raw = data.get("risks") or []
-        risk_names = []
-        danger_count = 0
-        warn_count = 0
+    def _parse(self, d: dict) -> dict:
+        def pct_norm(v):
+            """Normalise pct: RugCheck topHolders use 0.0-1.0, convert to 0-100."""
+            v = float(v or 0)
+            return v * 100 if v <= 1.0 else v
 
-        for r in risks_raw:
-            level = r.get("level", "")
-            name  = r.get("name", "")
-            if name:
-                risk_names.append(name)
-            if level == "danger":
-                danger_count += 1
-            elif level == "warn":
-                warn_count += 1
+        # ── Mint / Freeze ──────────────────────────────────────────────────────
+        mintable  = d.get("mintAuthority")  is not None
+        freezable = d.get("freezeAuthority") is not None
+        rugged    = bool(d.get("rugged"))
 
-        score      = int(data.get("score", 500) or 500)
-        mintable   = data.get("mintAuthority") is not None
-        freezable  = data.get("freezeAuthority") is not None
+        # ── Score ──────────────────────────────────────────────────────────────
+        # RugCheck score: higher = MORE risky (opposite of what you'd expect)
+        # We invert it: safe_score = max(0, 1000 - raw_score) for our use
+        raw_score  = int(d.get("score") or 0)
+        safe_score = max(0, 1000 - raw_score)  # 1000 = safest, 0 = most risky
 
-        # Top holders
-        top_holders = data.get("topHolders") or []
-        total_supply = float(data.get("totalSupply") or data.get("supply") or 1)
+        # ── Risks ──────────────────────────────────────────────────────────────
+        risks_raw    = d.get("risks") or []
+        risk_names   = [r["name"] for r in risks_raw if r.get("name")]
+        danger_count = sum(1 for r in risks_raw if r.get("level") == "danger")
+        warn_count   = sum(1 for r in risks_raw if r.get("level") == "warn")
+
+        # ── Top Holders ────────────────────────────────────────────────────────
+        top_holders  = d.get("topHolders") or []
+        creator_addr = d.get("creator") or ""
+
         top10_pct = 0.0
-        if top_holders:
-            raw_pct = sum(float(h.get("pct", 0) or 0) for h in top_holders[:10])
-            # Mobula returns 0-1 decimals, rugcheck may return 0-100
-            top10_pct = raw_pct * 100 if raw_pct <= 1.0 else raw_pct
+        dev_pct   = 0.0
+        insider_holders_pct = 0.0
 
-        # LP lock
-        markets = data.get("markets") or []
-        lp_locked = any(m.get("lpLocked") or m.get("lp_locked") for m in markets)
+        for h in top_holders[:20]:  # check top 20 in case creator is not top 10
+            p = pct_norm(h.get("pct", 0))
+            owner   = h.get("owner","") or h.get("address","") or ""
+            is_ins  = bool(h.get("insider"))
 
-        # Insider pct
-        insider_pct = float(data.get("insiderNetworkPct") or 0) * 100
-        if insider_pct > 100:
-            insider_pct = insider_pct / 100
+            if len(top_holders[:10]) >= 1 and h in top_holders[:10]:
+                top10_pct += p
 
-        # Dev holding — find creator in top holders
-        creator = data.get("creator") or ""
-        dev_pct = 0.0
-        for h in top_holders:
-            if h.get("address") == creator or h.get("owner") == creator:
-                dev_pct = float(h.get("pct", 0) or 0)
-                if dev_pct <= 1.0:
-                    dev_pct *= 100
+            if owner == creator_addr and dev_pct == 0:
+                dev_pct = p
+
+            if is_ins:
+                insider_holders_pct += p
+
+        # ── Insider % from graphInsiderReport (more accurate) ─────────────────
+        graph = d.get("graphInsiderReport") or {}
+        insider_pct = 0.0
+        if graph:
+            hp = float(graph.get("holdingPercent") or 0)
+            insider_pct = hp * 100 if hp <= 1.0 else hp
+        if insider_pct == 0 and insider_holders_pct > 0:
+            insider_pct = insider_holders_pct
+
+        # ── LP lock ────────────────────────────────────────────────────────────
+        markets   = d.get("markets") or []
+        lp_locked = False
+        for m in markets:
+            lp = m.get("lp") or {}
+            lp_locked_pct = float(
+                lp.get("lpLockedPct") or m.get("lpLockedPct") or 0
+            )
+            if lp_locked_pct > 0:
+                lp_locked = True
                 break
 
-        # Derive status
-        if (mintable and freezable) or danger_count >= 2:
+        # ── Total liquidity ────────────────────────────────────────────────────
+        total_liq = float(d.get("totalMarketLiquidity") or 0)
+
+        # ── Status ────────────────────────────────────────────────────────────
+        if rugged or (mintable and freezable) or danger_count >= 2:
             status = "Danger"
         elif danger_count >= 1 or mintable or freezable or top10_pct >= 80:
             status = "Warn"
-        elif score >= 700 and warn_count == 0:
+        elif safe_score >= 700 and danger_count == 0 and warn_count <= 1:
             status = "Good"
         else:
             status = "Warn"
 
-        if not risk_names:
-            risk_names = ["No major risks detected"]
-
-        report = {
-            "score":           score,
-            "risks":           risk_names,
-            "mintable":        mintable,
-            "freezable":       freezable,
-            "lp_locked":       lp_locked,
-            "status":          status,
-            "top_holder_pct":  round(top10_pct, 1),
-            "insider_pct":     round(insider_pct, 1),
-            "dev_holding_pct": round(dev_pct, 1),
-            "snipers_pct":     0.0,
-            "bundles_pct":     0.0,
+        return {
+            "score":              safe_score,      # inverted: 1000 = safe
+            "raw_score":          raw_score,        # original rugcheck score
+            "risks":              risk_names or ["No major risks detected"],
+            "mintable":           mintable,
+            "freezable":          freezable,
+            "lp_locked":          lp_locked,
+            "status":             status,
+            "top10_holders_pct":  round(min(top10_pct, 100.0), 2),
+            "dev_holding_pct":    round(min(dev_pct, 100.0), 2),
+            "insider_pct":        round(min(insider_pct, 100.0), 2),
+            "total_liquidity_usd": total_liq,
+            "rugged":             rugged,
         }
-        logger.debug(
-            f"RugCheck {mint[:8]}: {status} score={score} "
-            f"top10={top10_pct:.0f}% mint={mintable} freeze={freezable} lp_lock={lp_locked}"
-        )
-        return report
-
-    def _parse_full(self, data: dict, mint: str) -> dict:
-        """Parse /report response (same structure, just more fields)."""
-        return self._parse_summary(data, mint)
 
     def _unknown(self) -> dict:
         return {
-            "score": 0, "risks": ["Could not fetch rugcheck data"],
-            "mintable": False, "freezable": False, "lp_locked": False,
-            "status": "Unknown", "top_holder_pct": 0.0,
-            "insider_pct": 0.0, "dev_holding_pct": 0.0,
-            "snipers_pct": 0.0, "bundles_pct": 0.0,
+            "score": 0, "raw_score": 0,
+            "risks": ["Could not fetch rug data"],
+            "mintable": False, "freezable": False,
+            "lp_locked": False, "status": "Unknown",
+            "top10_holders_pct": 0.0,
+            "dev_holding_pct": 0.0,
+            "insider_pct": 0.0,
+            "total_liquidity_usd": 0.0,
+            "rugged": False,
         }
